@@ -8,6 +8,7 @@ from flask import Flask, request, jsonify
 import threading
 import signal
 import sys
+import time # Added for sleep
 
 # --- Global variables ---
 # PTY and subprocess related
@@ -39,13 +40,17 @@ def pty_reader_thread_function():
             if master_fd in readable:
                 try:
                     data = os.read(master_fd, 4096)
-                    if not data:  # EOF: PTY has been closed (e.g., bash exited)
-                        print("PTY EOF, stopping reader thread.")
+                    if data: # Ensure data is not empty before decoding
+                        decoded_data = data.decode('utf-8', 'ignore')
+                        # Log a snippet of the data read, escaping newlines for readability
+                        log_snippet = decoded_data[:60].replace('\n', '\\n').replace('\r', '\\r')
+                        print(f"PTY Read {len(decoded_data)} chars: '{log_snippet}...'")
+                        if stream:
+                            stream.feed(decoded_data)
+                    else:  # EOF: PTY has been closed (e.g., bash exited)
+                        print("PTY EOF (empty data read), stopping reader thread.")
                         pty_running = False # Signal to stop, if not already
                         break
-                    # Feed data to the virtual screen
-                    if stream:
-                        stream.feed(data.decode('utf-8', 'ignore'))
                 except OSError:  # Happens if FD is closed by another thread
                     print("PTY read error (FD likely closed), stopping reader thread.")
                     pty_running = False
@@ -65,7 +70,9 @@ def push_keystroke():
     Expects form data: {'keys': 'your_command\\n'}
     """
     global master_fd
+    app.logger.info(f"Received POST /keystroke. Form data: {request.form}")
     if not master_fd or not pty_running:
+        app.logger.warning("PTY not active for /keystroke")
         return jsonify({"error": "PTY not active or not initialized"}), 503
     try:
         keys = request.form.get('keys')
@@ -85,7 +92,9 @@ def get_screen_capture():
     Captures the current content of the virtual screen and returns it.
     """
     global screen
+    app.logger.info("Received GET /screen")
     if not screen or not pty_running:
+        app.logger.warning("Screen/PTY not active for /screen")
         return jsonify({"error": "Screen not active or not initialized"}), 503
     
     # Accessing screen.display and screen.cursor should be relatively safe.
@@ -96,7 +105,14 @@ def get_screen_capture():
         "y": screen.cursor.y,
         "hidden": screen.cursor.hidden
     }
+    app.logger.debug(f"Screen data: {display_data}, Cursor: {cursor_data}")
     return jsonify({"screen": display_data, "cursor": cursor_data})
+
+@app.errorhandler(404)
+def page_not_found(e):
+    """Handles 404 errors by logging and returning a JSON response."""
+    app.logger.warning(f"Invalid URL accessed: {request.path} - {e}")
+    return jsonify(error=f"Endpoint not found: {request.path}"), 404
 
 # --- Cleanup Function ---
 def cleanup_pty_and_process():
@@ -233,6 +249,10 @@ def main():
         pty_thread = threading.Thread(target=pty_reader_thread_function, daemon=True)
         pty_thread.start()
 
+        # Give bash and pty_reader a moment to initialize and print the first prompt
+        print("Waiting a moment for PTY to initialize...")
+        time.sleep(0.5) # Increased slightly for more reliability
+
         # Set up signal handler for Ctrl+C (SIGINT)
         # This should be set up after PTY and process are initialized.
         signal.signal(signal.SIGINT, sigint_handler)
@@ -244,8 +264,8 @@ def main():
         
         # Run Flask web server.
         # use_reloader=False is critical when managing subprocesses and threads.
-        # debug=False is generally recommended for stability with this setup.
-        app.run(host='127.0.0.1', port=5000, debug=False, use_reloader=False)
+        # debug=True enables Flask's debugger and more verbose logging.
+        app.run(host='127.0.0.1', port=5000, debug=True, use_reloader=False)
 
     except KeyboardInterrupt:
         print("KeyboardInterrupt caught in main. Shutting down...")
