@@ -97,11 +97,12 @@ def pty_reader_thread_function():
                         decoded_data = data.decode('utf-8', 'ignore')
                         # Log a snippet of the data read, escaping newlines for readability
                         log_snippet = decoded_data[:60].replace('\n', '\\n').replace('\r', '\\r')
-                        print(f"PTY Read {len(decoded_data)} chars: '{log_snippet}...'")
+                        # Using app.logger for consistency if Flask's logger is configured
+                        app.logger.debug(f"PTY Read {len(decoded_data)} chars: '{log_snippet}...'")
                         if stream:
                             stream.feed(decoded_data)
-                    else:  # EOF: PTY has been closed (e.g., bash exited)
-                        print("PTY EOF (empty data read), stopping reader thread.")
+                    else:  # EOF: PTY has been closed (e.g., shell exited)
+                        app.logger.info("PTY EOF (empty data read), stopping reader thread.")
                         pty_running = False # Signal to stop, if not already
                         break
                 except OSError:  # Happens if FD is closed by another thread
@@ -254,25 +255,28 @@ def cleanup_pty_and_process():
         if pty_thread.is_alive():
             print("PTY reader thread did not exit gracefully.")
 
-    # Terminate the subprocess (bash and its children)
+    # Terminate the subprocess (shell and its children)
     if proc and proc.poll() is None:  # Check if process is still running
-        print(f"Terminating bash process tree (PGID: {os.getpgid(proc.pid)})...")
+        shell_pgid = os.getpgid(proc.pid) # Get PGID before it potentially exits
+        print(f"Terminating shell process tree (PGID: {shell_pgid})...")
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)  # Send SIGTERM to the process group
+            os.killpg(shell_pgid, signal.SIGTERM)  # Send SIGTERM to the process group
             proc.wait(timeout=2)  # Wait for graceful termination
         except ProcessLookupError:
-            print("Bash process group already exited.")
+            print(f"Shell process group (PGID: {shell_pgid}) already exited.")
         except subprocess.TimeoutExpired:
-            print("Bash process tree did not terminate gracefully with SIGTERM, sending SIGKILL...")
+            print(f"Shell process tree (PGID: {shell_pgid}) did not terminate gracefully with SIGTERM, sending SIGKILL...")
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # Force kill
+                os.killpg(shell_pgid, signal.SIGKILL)  # Force kill
                 proc.wait(timeout=2)  # Wait for forced termination
+            except ProcessLookupError: # Could have exited between SIGTERM and SIGKILL
+                print(f"Shell process group (PGID: {shell_pgid}) already exited before SIGKILL.")
             except Exception as e_kill:
-                print(f"Error force killing process group: {e_kill}")
+                print(f"Error force killing process group (PGID: {shell_pgid}): {e_kill}")
         except Exception as e_term:
-            print(f"Error terminating process group: {e_term}")
+            print(f"Error terminating process group (PGID: {shell_pgid}): {e_term}")
     elif proc:
-        print("Bash process already terminated.")
+        print("Shell process already terminated.")
     proc = None # Mark as handled
 
     # Close PTY file descriptors
@@ -308,12 +312,16 @@ def sigint_handler(sig, frame):
     pty_running = False # Signal PTY reader thread to stop ASAP
 
     if proc and proc.poll() is None:
-        print("SIGINT: Terminating bash process tree immediately...")
+        pgid_to_signal = -1
         try:
-            # Send SIGTERM to the entire process group of bash
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            pgid_to_signal = os.getpgid(proc.pid)
+            print(f"SIGINT: Terminating shell process tree (PGID: {pgid_to_signal}) immediately...")
+            # Send SIGTERM to the entire process group of the shell
+            os.killpg(pgid_to_signal, signal.SIGTERM)
+        except ProcessLookupError:
+             print(f"SIGINT: Shell process (PGID: {pgid_to_signal if pgid_to_signal != -1 else 'unknown'}) already exited.")
         except Exception as e:
-            print(f"SIGINT: Error sending SIGTERM to process group: {e}")
+            print(f"SIGINT: Error sending SIGTERM to process group (PGID: {pgid_to_signal if pgid_to_signal != -1 else 'unknown'}): {e}")
     
     # Raising KeyboardInterrupt allows Flask to perform its own shutdown,
     # and then the `finally` block in `main()` will execute `cleanup_pty_and_process`.
@@ -344,19 +352,23 @@ def main():
         master_fd = master_fd_temp
         slave_fd = slave_fd_temp # Store parent's copy of slave FD for cleanup
 
-        # Start bash in the PTY.
-        # -i for interactive mode.
-        # preexec_fn=os.setsid makes bash a new session leader, crucial for os.killpg.
+        # Determine the shell to use
+        shell_cmd = os.environ.get("SHELL", "/bin/bash") # Default to /bin/bash if $SHELL is not set
+        print(f"Using shell: {shell_cmd}")
+
+        # Start the shell in the PTY.
+        # -i for interactive mode (if supported by the shell).
+        # preexec_fn=os.setsid makes the shell a new session leader, crucial for os.killpg.
         proc = subprocess.Popen(
-            ["/bin/bash", "-i"],
-            stdin=slave_fd,  # Use the slave FD for bash's stdio
+            [shell_cmd, "-i"], # Attempt to run in interactive mode
+            stdin=slave_fd,  # Use the slave FD for shell's stdio
             stdout=slave_fd,
             stderr=slave_fd,
             env=env,
             close_fds=True,   # Close other FDs in child, except 0,1,2 which are set by stdin/out/err
             preexec_fn=os.setsid
         )
-        print(f"Bash started with PID: {proc.pid}, PGID: {os.getpgid(proc.pid)}")
+        print(f"Shell process ({shell_cmd}) started with PID: {proc.pid}, PGID: {os.getpgid(proc.pid)}")
 
         # After Popen, the child has its stdio connected to its end of the PTY.
         # The parent's copy of slave_fd is not directly used for read/write by the parent,
