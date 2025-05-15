@@ -217,13 +217,17 @@ def push_keystroke_sync():
                         # Assumption: 1 line of output from `pstree <pid>` means the process has no children.
                         if len(output_lines) == 1:
                             app.logger.info(f"macOS pstree check: Shell PID {shell_pid} has no children. Command complete.")
-                            return jsonify({"status": "success", "message": "Command completed (macOS pstree check)." })
+                            completion_message = "Command completed (macOS pstree check)."
+                            command_completed_normally = True
+                            break # Exit the loop, output will be handled below
                         # else: shell has children (pstree output > 1 line), command still running. Loop continues.
                     else:
                         # pstree command failed. Check if the shell process itself has exited.
                         if proc.poll() is not None:
                              app.logger.info(f"Shell process (PID: {shell_pid}) exited (detected after pstree failure).")
-                             return jsonify({"status": "success", "message": "Shell process exited (detected after pstree failure)."})
+                             completion_message = "Shell process exited (detected after pstree failure)."
+                             command_completed_normally = True # Consider this a form of completion
+                             break # Exit the loop, output will be handled below
                         # Shell is still running, but pstree failed for another reason.
                         app.logger.warning(f"pstree command for PID {shell_pid} failed (rc={result.returncode}, stderr: {result.stderr.strip()}). Assuming command still running or error with pstree.")
                         # Continue loop; will eventually timeout if this state persists.
