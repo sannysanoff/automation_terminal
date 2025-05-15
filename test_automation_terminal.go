@@ -679,6 +679,18 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 
 	time.Sleep(200 * time.Millisecond) // Short final delay for output processing
 
+	// If timeout happened, try to reset the PTY to sane mode
+	if timeoutHappened && ptyMaster != nil {
+		go func() {
+			// Run "stty sane" in the nested PTY, ignore errors and output
+			cmd := exec.Command("stty", "sane")
+			cmd.Stdin = ptyMaster
+			cmd.Stdout = nil
+			cmd.Stderr = nil
+			_ = cmd.Run()
+		}()
+	}
+
 	status := "success"
 	httpStatusCode := http.StatusOK
 
