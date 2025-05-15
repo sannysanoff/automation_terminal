@@ -62,34 +62,38 @@ class LoggingStream(pyte.Stream):
         # Now, log the character for our separate line buffer
         with pyte_listener_lock:
             if char == "\n":
-                if verbose_logging_enabled:
-                    app.logger.debug(f"Verbose LoggingStream LF: About to append CBL ('{current_line_buffer_for_listener}') to PLL (len {len(pyte_listener_lines)}): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
+                app.logger.debug(f"LoggingStream LF: Appending CBL ('{current_line_buffer_for_listener}') to PLL. Old PLL len: {len(pyte_listener_lines)}")
                 pyte_listener_lines.append(current_line_buffer_for_listener)
+                app.logger.debug(f"LoggingStream LF: CBL ('{current_line_buffer_for_listener}') appended. New PLL len: {len(pyte_listener_lines)}. Clearing CBL.")
                 current_line_buffer_for_listener = ""
-                if verbose_logging_enabled:
-                    app.logger.debug(f"Verbose LoggingStream LF: After append, PLL (len {len(pyte_listener_lines)}) is {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}, CBL is ('{current_line_buffer_for_listener}')")
+                app.logger.debug(f"LoggingStream LF: CBL cleared. PLL (last 3): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
+                if verbose_logging_enabled: # Keep verbose for even more detail if needed
+                    app.logger.debug(f"Verbose LoggingStream LF: Full context: PLL (len {len(pyte_listener_lines)}) is {pyte_listener_lines[-5:] if len(pyte_listener_lines) > 5 else pyte_listener_lines}, CBL is ('{current_line_buffer_for_listener}')")
             elif char == "\r":
-                # Carriage return: current line is considered finished. Add it to the list.
-                if verbose_logging_enabled:
-                    app.logger.debug(f"Verbose LoggingStream CR: About to append CBL ('{current_line_buffer_for_listener}') to PLL (len {len(pyte_listener_lines)}): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
+                app.logger.debug(f"LoggingStream CR: Appending CBL ('{current_line_buffer_for_listener}') to PLL. Old PLL len: {len(pyte_listener_lines)}")
                 pyte_listener_lines.append(current_line_buffer_for_listener) # Always append, even if empty
+                app.logger.debug(f"LoggingStream CR: CBL ('{current_line_buffer_for_listener}') appended. New PLL len: {len(pyte_listener_lines)}. Clearing CBL.")
                 current_line_buffer_for_listener = ""
-                if verbose_logging_enabled:
-                    app.logger.debug(f"Verbose LoggingStream CR: After append, PLL (len {len(pyte_listener_lines)}) is {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}, CBL is ('{current_line_buffer_for_listener}')")
+                app.logger.debug(f"LoggingStream CR: CBL cleared. PLL (last 3): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
+                if verbose_logging_enabled: # Keep verbose for even more detail if needed
+                    app.logger.debug(f"Verbose LoggingStream CR: Full context: PLL (len {len(pyte_listener_lines)}) is {pyte_listener_lines[-5:] if len(pyte_listener_lines) > 5 else pyte_listener_lines}, CBL is ('{current_line_buffer_for_listener}')")
             elif char == "\x08":  # Backspace
                 if current_line_buffer_for_listener:
-                    if verbose_logging_enabled:
-                        app.logger.debug(f"Verbose LoggingStream BS: CBL before: '{current_line_buffer_for_listener}'")
+                    old_cbl = current_line_buffer_for_listener
                     current_line_buffer_for_listener = current_line_buffer_for_listener[:-1]
-                    if verbose_logging_enabled:
-                        app.logger.debug(f"Verbose LoggingStream BS: CBL after: '{current_line_buffer_for_listener}'")
+                    app.logger.debug(f"LoggingStream BS: CBL was '{old_cbl}', now '{current_line_buffer_for_listener}'")
+                else:
+                    app.logger.debug(f"LoggingStream BS: CBL empty, no change.")
+                if verbose_logging_enabled: # Keep verbose for even more detail if needed
+                     app.logger.debug(f"Verbose LoggingStream BS: Context: PLL (len {len(pyte_listener_lines)}): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
             # Check if it's a printable char (not a control character)
             elif not unicodedata.category(char).startswith('C'):
-                if verbose_logging_enabled:
-                    app.logger.debug(f"Verbose LoggingStream CHAR: About to add char '{char.encode('unicode_escape').decode()}' to CBL ('{current_line_buffer_for_listener}')")
+                # Unconditional log for character addition
+                app.logger.debug(f"LoggingStream CHAR: Adding char '{char.encode('unicode_escape').decode()}' to CBL. Old CBL: '{current_line_buffer_for_listener}'")
                 current_line_buffer_for_listener += char
-                if verbose_logging_enabled:
-                    app.logger.debug(f"Verbose LoggingStream CHAR: After add, CBL is ('{current_line_buffer_for_listener}')")
+                app.logger.debug(f"LoggingStream CHAR: CBL after adding char: '{current_line_buffer_for_listener}'")
+                if verbose_logging_enabled: # Keep verbose for even more detail if needed
+                    app.logger.debug(f"Verbose LoggingStream CHAR: Context: PLL (len {len(pyte_listener_lines)}): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
             # Else: it's a control character (like ESC, etc.) not explicitly handled for the log.
             # It was still processed by super().dispatch() for pyte.Screen.
 
