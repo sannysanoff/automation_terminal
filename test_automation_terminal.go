@@ -17,6 +17,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
 	"github.com/Azure/go-ansiterm"
 	"github.com/creack/pty"
 	"golang.org/x/sys/unix"
@@ -42,10 +43,10 @@ var (
 	// currentLineBuffer           bytes.Buffer // Replaced by eventHandler.lineBufferForCapture
 	// capturedLinesMu             sync.Mutex // Replaced by eventHandler.mu (or could be separate if needed)
 
-	verboseLoggingEnabled    bool
-	maxSyncWaitSeconds int = 60 // Maximum wait time for synchronous keystroke command completion
-	defaultPtyCols     int = 80 // Changed to int for easier use with TermEventHandler
-	defaultPtyLines    int = 25 // Changed to int
+	verboseLoggingEnabled bool
+	maxSyncWaitSeconds    int = 60 // Maximum wait time for synchronous keystroke command completion
+	defaultPtyCols        int = 80 // Changed to int for easier use with TermEventHandler
+	defaultPtyLines       int = 25 // Changed to int
 )
 
 // --- Structs for HTTP responses ---
@@ -143,7 +144,6 @@ func setupPtyAndShell() error {
 	logInfo("Shell environment (selected keys): TERM=%s, PS1=%s, PROMPT=%s, PROMPT_COMMAND=%s, LANG=%s",
 		envMap["TERM"], envMap["PS1"], envMap["PROMPT"], envMap["PROMPT_COMMAND"], envMap["LANG"])
 
-
 	var err error
 	// Use pty.Open() to get both master and slave FDs
 	// ptmx is the master, tty is the slave
@@ -168,7 +168,7 @@ func setupPtyAndShell() error {
 
 	shellCmd = exec.Command(shellArgs[0], shellArgs[1:]...)
 	shellCmd.Env = finalEnv
-	shellCmd.Stdin = tty    // Use slave PTY for child's stdio
+	shellCmd.Stdin = tty // Use slave PTY for child's stdio
 	shellCmd.Stdout = tty
 	shellCmd.Stderr = tty
 
@@ -184,7 +184,6 @@ func setupPtyAndShell() error {
 	// The kernel should infer the controlling TTY from FD 0 if it's a TTY.
 	shellCmd.SysProcAttr.Setctty = true
 	// shellCmd.SysProcAttr.Ctty = int(tty.Fd()) // This line is removed.
-
 
 	err = shellCmd.Start()
 	if err != nil {
@@ -206,7 +205,6 @@ func setupPtyAndShell() error {
 	ansiParser = ansiterm.CreateParser("Ground", eventHandler)
 	// If verbose logging for ansiterm parser itself is desired:
 	// ansiParser = ansiterm.CreateParser("Ground", eventHandler, ansiterm.WithLogf(logDebug))
-
 
 	ptyRunningMu.Lock()
 	ptyRunning = true
@@ -362,9 +360,9 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 
 	if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
 		logInfo("Shell process exited shortly after command submission and initial sleep.")
-		
+
 		linesAfter, finalCurrentLine := eventHandler.GetCapturedLinesAndCurrentBuffer()
-		
+
 		outputSegment := linesAfter[len(linesBeforeCommandEffect):]
 		// The finalCurrentLine from eventHandler *is* the current line being built.
 		// If the command produced partial output without a newline, it's in finalCurrentLine.
@@ -391,7 +389,7 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 		if finalCurrentLine != "" {
 			outputSegment = append(outputSegment, finalCurrentLine)
 		}
-		
+
 		eventHandler.ResetCapturedLinesAndSetBuffer(finalCurrentLine)
 		logDebug("SYNC (shell exited path): Reset eventHandler captured lines. New buffer: '%s'", finalCurrentLine)
 
@@ -464,7 +462,7 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 			// Using sh -c for simplicity here.
 			psCmd := fmt.Sprintf("ps -o pid,ppid,comm -ax | awk '$2 == %d {print $1}'", shellPID)
 			cmd := exec.Command("sh", "-c", psCmd)
-			
+
 			output, err := cmd.Output()
 			if err != nil {
 				// If the command fails (e.g. awk not found, or ps error), check if shell exited.
@@ -500,7 +498,7 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		time.Sleep(500 * time.Millisecond) // Polling interval
 	}
-	
+
 	time.Sleep(200 * time.Millisecond) // Short final delay for output processing
 
 	status := "success"
@@ -517,7 +515,7 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 			completionMessage = "Shell process exited during command execution (final check)."
 		}
 	}
-	
+
 	linesAfterCommandEffect, finalCurrentLine := eventHandler.GetCapturedLinesAndCurrentBuffer()
 	logDebug("SYNC: lines_after_command_effect (len %d): %v", len(linesAfterCommandEffect), linesAfterCommandEffect)
 	logDebug("SYNC: final_current_line: '%s'", finalCurrentLine)
@@ -527,25 +525,25 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 	// 2. The command echo (if any)
 	// 3. The command output
 	// 4. The new prompt
-	
+
 	// Start with empty output
 	outputSegment = make([]string, 0)
-	
+
 	// If we had a current buffer (prompt) before sending command, include it
 	if currentBufferBefore != "" {
 		outputSegment = append(outputSegment, currentBufferBefore)
 	}
-	
+
 	// Include all new lines captured after sending command
 	outputSegment = append(outputSegment, linesAfterCommandEffect...)
-	
+
 	// Include the final current line only if it's not empty
 	// This prevents duplicate prompts when we have complete lines
-	if finalCurrentLine != "" && (len(outputSegment) == 0 || 
+	if finalCurrentLine != "" && (len(outputSegment) == 0 ||
 		!strings.HasSuffix(outputSegment[len(outputSegment)-1], "\n")) {
 		outputSegment = append(outputSegment, finalCurrentLine)
 	}
-	
+
 	// Reset capture for next command, keeping only the new prompt
 	eventHandler.ResetCapturedLinesAndSetBuffer(finalCurrentLine)
 	logDebug("SYNC: Reset eventHandler captured lines. New buffer: '%s'", finalCurrentLine)
@@ -577,7 +575,7 @@ func screenHandler(w http.ResponseWriter, r *http.Request) {
 		Y:      uint(cursorY),
 		Hidden: cursorHidden,
 	}
-	
+
 	logDebug("Screen data (first 3 lines): %v, Cursor: %+v", displayData[:min(3, len(displayData))], cursorData)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(ScreenResponse{Screen: displayData, Cursor: cursorData})
@@ -725,7 +723,6 @@ func main() {
 		fmt.Fprintln(w, "PTY Automation Server running. Endpoints: /keystroke, /keystroke_sync, /screen")
 	})
 
-
 	// Attempt to set host TTY to a sane state
 	if fileInfo, _ := os.Stdin.Stat(); (fileInfo.Mode() & os.ModeCharDevice) != 0 {
 		logInfo("Attempting to set host TTY to 'sane' mode.")
@@ -735,7 +732,6 @@ func main() {
 			logWarn("Failed to set TTY to sane mode: %v (stty output: %s)", err, saneCmd.String())
 		}
 	}
-
 
 	serverAddr := "127.0.0.1:5399"
 	logInfo("Starting HTTP server on %s", serverAddr)
