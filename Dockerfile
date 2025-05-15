@@ -1,14 +1,12 @@
-FROM python:3.11-slim-bookworm
+# --- Build stage ---
+FROM python:3.11-slim-bookworm AS build
 
-# Install dependencies for Go and build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates build-essential git procps \
     && rm -rf /var/lib/apt/lists/*
 
-# Set Go version
 ENV GOVERSION=1.24.3
 
-# Download and install Go based on architecture
 RUN set -eux; \
     arch="$(uname -m)"; \
     case "$arch" in \
@@ -23,12 +21,15 @@ RUN set -eux; \
 
 ENV PATH="/usr/local/go/bin:${PATH}"
 
-# Copy source code
 WORKDIR /src
 COPY . .
 
-# Build Go project
 RUN go build -o /automation_terminal
 
-# Default command
+# --- Final image ---
+FROM python:3.11-slim-bookworm
+
+WORKDIR /
+COPY --from=build /automation_terminal /automation_terminal
+
 CMD ["/automation_terminal"]
