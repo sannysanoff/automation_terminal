@@ -337,7 +337,7 @@ def main():
         # -f: Start Zsh without sourcing .zshrc or other startup files.
         # -i: Force interactive mode.
         shell_args_for_popen.extend(["-f", "-i"])
-        env["PROMPT"] = "[PTY-ZSH]$ " # Simple prompt for zsh
+        env["PROMPT"] = "[vm:%~] %(#.#.$) " # New zsh prompt
         # Zsh might still try to source global rc files (/etc/zsh*), -f primarily targets user files.
     elif shell_name == "bash":
         app.logger.info(f"Configuring for bash: {shell_path}")
@@ -345,14 +345,14 @@ def main():
         # --noprofile: Do not read system-wide or personal profile initialization files.
         # -i: Force interactive mode.
         shell_args_for_popen.extend(["--norc", "--noprofile", "-i"])
-        env["PS1"] = "[PTY-BASH]$ " # Simple prompt for bash
+        env["PS1"] = "[vm:\\w] \\$ " # New bash prompt
         # PROMPT_COMMAND can also affect bash prompts, ensure it's empty.
         env["PROMPT_COMMAND"] = "" 
     else: # For other shells (e.g., sh, dash, ksh)
         app.logger.info(f"Configuring for generic shell ({shell_name}): {shell_path}")
         # Attempt interactive mode. Startup file skipping varies by shell.
         shell_args_for_popen.append("-i") 
-        env["PS1"] = f"[PTY-{shell_name.upper()}]$ " # Generic PS1
+        env["PS1"] = f"[vm:\\w] \\$ " # New generic prompt, using bash-like syntax
 
     app.logger.info(f"Shell command for Popen: {shell_args_for_popen}")
     app.logger.info(f"Shell environment for Popen (selected keys): "
