@@ -127,7 +127,7 @@ def push_keystroke_sync():
         shell_pid = proc.pid
         shell_pgid = os.getpgid(shell_pid) # PGID of the shell process itself
         app.logger.info(f"Waiting for command completion. Shell PID: {shell_pid}, Shell PGID: {shell_pgid}. Max wait: {MAX_SYNC_WAIT_SECONDS}s.")
-        app.logger.debug(f"Using slave FD {slave_fd} for tcgetpgrp checks.")
+        # Note: slave_fd related debug logging moved into platform-specific block
 
         start_time = time.time()
         while time.time() - start_time < MAX_SYNC_WAIT_SECONDS:
@@ -135,32 +135,61 @@ def push_keystroke_sync():
                 app.logger.info(f"Shell process (PID: {shell_pid}) exited during wait.")
                 return jsonify({"status": "success", "message": "Shell process exited during command execution."})
 
-            try:
-                sfd_isatty = os.isatty(slave_fd)
-                sfd_name = "N/A"
-                if sfd_isatty:
-                    try:
-                        sfd_name = os.ttyname(slave_fd)
-                    except OSError as e_ttyname:
-                        sfd_name = f"Error getting ttyname: {e_ttyname}"
-                app.logger.debug(f"Diagnostics for slave_fd ({slave_fd}): isatty={sfd_isatty}, name='{sfd_name}'")
+            # Platform-specific command completion check
+            if sys.platform == "darwin": # macOS
+                try:
+                    pstree_cmd = ["pstree", str(shell_pid)]
+                    # Execute pstree and capture its output.
+                    result = subprocess.run(pstree_cmd, capture_output=True, text=True, check=False)
+                    
+                    app.logger.debug(f"pstree for PID {shell_pid} (rc={result.returncode}):\nSTDOUT: {result.stdout.strip()}\nSTDERR: {result.stderr.strip()}")
 
-                current_foreground_pgid = os.tcgetpgrp(slave_fd)
-                app.logger.debug(f"Polling PTY's foreground PGID: {current_foreground_pgid}. Shell's PGID: {shell_pgid}.")
-            except OSError as e:
-                # This can happen if slave_fd is no longer valid (e.g., PTY closed, shell exited abruptly)
-                # or if tcgetpgrp is not permitted (e.g., ENOTTY on macOS for non-controlling TTYs)
-                app.logger.error(f"Error calling tcgetpgrp on slave_fd ({slave_fd}): {e} (errno: {e.errno}). Assuming command finished or error.")
-                if proc.poll() is not None: # Check again if shell exited
-                     return jsonify({"status": "success", "message": "Shell process exited, PTY state uncertain."})
-                return jsonify({"status": "error", "message": f"Error checking PTY foreground process group: {e}"}), 500
+                    if result.returncode == 0:
+                        output_lines = result.stdout.strip().splitlines()
+                        # Assumption: 1 line of output from `pstree <pid>` means the process has no children.
+                        if len(output_lines) == 1:
+                            app.logger.info(f"macOS pstree check: Shell PID {shell_pid} has no children. Command complete.")
+                            return jsonify({"status": "success", "message": "Command completed (macOS pstree check)." })
+                        # else: shell has children (pstree output > 1 line), command still running. Loop continues.
+                    else:
+                        # pstree command failed. Check if the shell process itself has exited.
+                        if proc.poll() is not None:
+                             app.logger.info(f"Shell process (PID: {shell_pid}) exited (detected after pstree failure).")
+                             return jsonify({"status": "success", "message": "Shell process exited (detected after pstree failure)."})
+                        # Shell is still running, but pstree failed for another reason.
+                        app.logger.warning(f"pstree command for PID {shell_pid} failed (rc={result.returncode}, stderr: {result.stderr.strip()}). Assuming command still running or error with pstree.")
+                        # Continue loop; will eventually timeout if this state persists.
+                
+                except FileNotFoundError:
+                    app.logger.error("'pstree' command not found. This is required for /keystroke_sync on macOS.")
+                    return jsonify({"status": "error", "message": "'pstree' command not found. Required for sync operations on macOS."}), 500
+                except Exception as e_pstree:
+                    app.logger.error(f"Unexpected error during pstree check for PID {shell_pid}: {e_pstree}", exc_info=True)
+                    return jsonify({"status": "error", "message": f"Unexpected error during pstree check: {e_pstree}"}), 500
+            
+            else: # Not macOS (e.g., Linux), use existing tcgetpgrp logic
+                app.logger.debug(f"Using tcgetpgrp on slave FD {slave_fd} for non-macOS platform (Shell PGID: {shell_pgid}).")
+                try:
+                    sfd_isatty = os.isatty(slave_fd)
+                    sfd_name = "N/A"
+                    if sfd_isatty:
+                        try:
+                            sfd_name = os.ttyname(slave_fd)
+                        except OSError as e_ttyname:
+                            sfd_name = f"Error getting ttyname: {e_ttyname}"
+                    app.logger.debug(f"Diagnostics for slave_fd ({slave_fd}): isatty={sfd_isatty}, name='{sfd_name}'")
 
-            if current_foreground_pgid == shell_pgid:
-                # The shell's process group is the foreground group on the PTY.
-                # This means the shell is at a prompt, ready for new input.
-                # Any command it launched in the foreground has completed.
-                app.logger.info(f"Shell (PGID {shell_pgid}) is foreground process group on PTY. Command considered complete.")
-                return jsonify({"status": "success", "message": "Command completed."})
+                    current_foreground_pgid = os.tcgetpgrp(slave_fd)
+                    app.logger.debug(f"Polling PTY's foreground PGID: {current_foreground_pgid}. Shell's PGID: {shell_pgid}.")
+                except OSError as e:
+                    app.logger.error(f"Error calling tcgetpgrp on slave_fd ({slave_fd}): {e} (errno: {e.errno}). Assuming command finished or error.")
+                    if proc.poll() is not None: 
+                         return jsonify({"status": "success", "message": "Shell process exited, PTY state uncertain."})
+                    return jsonify({"status": "error", "message": f"Error checking PTY foreground process group: {e}"}), 500
+
+                if current_foreground_pgid == shell_pgid:
+                    app.logger.info(f"Shell (PGID {shell_pgid}) is foreground process group on PTY. Command considered complete.")
+                    return jsonify({"status": "success", "message": "Command completed."})
             
             time.sleep(0.5) # Polling interval
 
