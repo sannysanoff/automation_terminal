@@ -537,12 +537,12 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	// Include all new lines captured after sending command
-	for _, line := range linesAfterCommandEffect {
-		outputSegment = append(outputSegment, line)
-	}
+	outputSegment = append(outputSegment, linesAfterCommandEffect...)
 	
-	// Include the final current line (new prompt or partial output)
-	if finalCurrentLine != "" {
+	// Include the final current line only if it's not empty
+	// This prevents duplicate prompts when we have complete lines
+	if finalCurrentLine != "" && (len(outputSegment) == 0 || 
+		!strings.HasSuffix(outputSegment[len(outputSegment)-1], "\n")) {
 		outputSegment = append(outputSegment, finalCurrentLine)
 	}
 	

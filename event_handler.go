@@ -184,15 +184,18 @@ func (h *TermEventHandler) Print(b byte) error {
 
 	// Line capture logic for /keystroke_sync
 	if char == '\n' {
-		// Always append current buffer and include the newline in output
-		h.capturedLinesForSync = append(h.capturedLinesForSync, h.lineBufferForCapture.String()+"\n")
-		logDebug("EventHandler LineCapture LF: Appending CBL ('%s') to PLL. New PLL len: %d. Clearing CBL.", h.lineBufferForCapture.String(), len(h.capturedLinesForSync))
+		// Append current buffer and include the newline
+		line := h.lineBufferForCapture.String()
+		if line != "" || len(h.capturedLinesForSync) == 0 {
+			// Only add empty line if it's the first line (prompt)
+			h.capturedLinesForSync = append(h.capturedLinesForSync, line+"\n")
+			logDebug("EventHandler LineCapture LF: Appending CBL ('%s') to PLL. New PLL len: %d. Clearing CBL.", line, len(h.capturedLinesForSync))
+		}
 		h.lineBufferForCapture.Reset()
 	} else if char == '\r' {
-		// For CR, append current buffer (without CR) and clear
-		h.capturedLinesForSync = append(h.capturedLinesForSync, h.lineBufferForCapture.String())
-		logDebug("EventHandler LineCapture CR: Appending CBL ('%s') to PLL. New PLL len: %d. Clearing CBL.", h.lineBufferForCapture.String(), len(h.capturedLinesForSync))
+		// For CR, just reset buffer - we'll capture on LF
 		h.lineBufferForCapture.Reset()
+		logDebug("EventHandler LineCapture CR: Resetting CBL")
 	} else if char == '\b' { // Backspace
 		if h.lineBufferForCapture.Len() > 0 {
 			oldCBL := h.lineBufferForCapture.String()
