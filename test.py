@@ -47,6 +47,11 @@ class LoggingStream(pyte.Stream):
     def __init__(self): # screen argument removed
         super().__init__() # Correct call to superclass __init__
         # Uses global pyte_listener_lines, current_line_buffer_for_listener, and pyte_listener_lock
+        # Diagnostic prints for MRO and superclass attributes
+        print(f"DIAGNOSTIC: LoggingStream MRO: {LoggingStream.mro()}", file=sys.stderr, flush=True)
+        print(f"DIAGNOSTIC: pyte.Stream has 'dispatch' attribute? {'dispatch' in dir(pyte.Stream)}", file=sys.stderr, flush=True)
+        print(f"DIAGNOSTIC: type(pyte.Stream.dispatch) is {type(pyte.Stream.dispatch) if 'dispatch' in dir(pyte.Stream) else 'N/A'}", file=sys.stderr, flush=True)
+
 
     def dispatch(self, event: str, *args, **kwargs) -> None: # Signature changed
         # Raw print to stderr to confirm entry, bypassing Flask logger for this specific check.
@@ -59,7 +64,10 @@ class LoggingStream(pyte.Stream):
 
         # Let pyte.Stream.dispatch handle passing to all attached listeners (e.g., screen) first.
         # This ensures screen.display and screen.cursor are up-to-date before our custom logic.
-        super().dispatch(event, *args, **kwargs) # Corrected call to superclass dispatch
+        # --- TEMPORARILY COMMENTED OUT FOR DIAGNOSTICS ---
+        # super().dispatch(event, *args, **kwargs) # Corrected call to superclass dispatch
+        print(f"DIAGNOSTIC: super().dispatch was SKIPPED in LoggingStream.dispatch for event='{event}'", file=sys.stderr, flush=True)
+
 
         # Now, log the character for our separate line buffer, only if it's a "TEXT" event.
         if event == "TEXT":
