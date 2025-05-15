@@ -49,6 +49,9 @@ class LoggingStream(pyte.Stream):
         # Uses global pyte_listener_lines, current_line_buffer_for_listener, and pyte_listener_lock
 
     def dispatch(self, char: str) -> None:
+        # Raw print to stderr to confirm entry, bypassing Flask logger for this specific check.
+        print(f"RAW_DISPATCH_ENTRY: char='{char.encode('unicode_escape').decode()}'", file=sys.stderr, flush=True)
+        
         global current_line_buffer_for_listener, pyte_listener_lines, pyte_listener_lock, verbose_logging_enabled
         # Log entry into dispatch, and the character being processed (escaped for readability)
         # This log is NOT conditional on verbose_logging_enabled to ensure we see if dispatch is called.
