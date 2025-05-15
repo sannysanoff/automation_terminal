@@ -44,61 +44,73 @@ MAX_SYNC_WAIT_SECONDS = 60
 
 # --- Custom Pyte Stream for Logging ---
 class LoggingStream(pyte.Stream):
-    def __init__(self, screen):
-        super().__init__(screen)
+    def __init__(self): # screen argument removed
+        super().__init__() # Correct call to superclass __init__
         # Uses global pyte_listener_lines, current_line_buffer_for_listener, and pyte_listener_lock
 
-    def dispatch(self, char: str) -> None:
+    def dispatch(self, event: str, *args, **kwargs) -> None: # Signature changed
         # Raw print to stderr to confirm entry, bypassing Flask logger for this specific check.
-        print(f"RAW_DISPATCH_ENTRY: char='{char.encode('unicode_escape').decode()}'", file=sys.stderr, flush=True)
+        # Log event and args for better diagnostics.
+        print(f"RAW_DISPATCH_ENTRY: event='{event}', args={args}, kwargs={kwargs}", file=sys.stderr, flush=True)
         
         global current_line_buffer_for_listener, pyte_listener_lines, pyte_listener_lock, verbose_logging_enabled
-        # Log entry into dispatch, and the character being processed (escaped for readability)
-        # This log is NOT conditional on verbose_logging_enabled to ensure we see if dispatch is called.
-        # We also log the perceived state of verbose_logging_enabled from within this method.
-        app.logger.debug(f"LoggingStream.dispatch entered: char='{char.encode('unicode_escape').decode()}', verbose_enabled_in_dispatch={verbose_logging_enabled}")
+        # Log entry into dispatch, using event and args.
+        app.logger.debug(f"LoggingStream.dispatch entered: event='{event}', args={args}, verbose_enabled_in_dispatch={verbose_logging_enabled}")
 
-        # Let pyte.Stream handle the character first for screen updates
-        # This ensures screen.display and screen.cursor are up-to-date
-        super().dispatch(char)
+        # Let pyte.Stream.dispatch handle passing to all attached listeners (e.g., screen) first.
+        # This ensures screen.display and screen.cursor are up-to-date before our custom logic.
+        super().dispatch(event, *args, **kwargs) # Corrected call to superclass dispatch
 
-        # Now, log the character for our separate line buffer
-        with pyte_listener_lock:
-            if char == "\n":
-                app.logger.debug(f"LoggingStream LF: Appending CBL ('{current_line_buffer_for_listener}') to PLL. Old PLL len: {len(pyte_listener_lines)}")
-                pyte_listener_lines.append(current_line_buffer_for_listener)
-                app.logger.debug(f"LoggingStream LF: CBL ('{current_line_buffer_for_listener}') appended. New PLL len: {len(pyte_listener_lines)}. Clearing CBL.")
-                current_line_buffer_for_listener = ""
-                app.logger.debug(f"LoggingStream LF: CBL cleared. PLL (last 3): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
-                if verbose_logging_enabled: # Keep verbose for even more detail if needed
-                    app.logger.debug(f"Verbose LoggingStream LF: Full context: PLL (len {len(pyte_listener_lines)}) is {pyte_listener_lines[-5:] if len(pyte_listener_lines) > 5 else pyte_listener_lines}, CBL is ('{current_line_buffer_for_listener}')")
-            elif char == "\r":
-                app.logger.debug(f"LoggingStream CR: Appending CBL ('{current_line_buffer_for_listener}') to PLL. Old PLL len: {len(pyte_listener_lines)}")
-                pyte_listener_lines.append(current_line_buffer_for_listener) # Always append, even if empty
-                app.logger.debug(f"LoggingStream CR: CBL ('{current_line_buffer_for_listener}') appended. New PLL len: {len(pyte_listener_lines)}. Clearing CBL.")
-                current_line_buffer_for_listener = ""
-                app.logger.debug(f"LoggingStream CR: CBL cleared. PLL (last 3): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
-                if verbose_logging_enabled: # Keep verbose for even more detail if needed
-                    app.logger.debug(f"Verbose LoggingStream CR: Full context: PLL (len {len(pyte_listener_lines)}) is {pyte_listener_lines[-5:] if len(pyte_listener_lines) > 5 else pyte_listener_lines}, CBL is ('{current_line_buffer_for_listener}')")
-            elif char == "\x08":  # Backspace
-                if current_line_buffer_for_listener:
-                    old_cbl = current_line_buffer_for_listener
-                    current_line_buffer_for_listener = current_line_buffer_for_listener[:-1]
-                    app.logger.debug(f"LoggingStream BS: CBL was '{old_cbl}', now '{current_line_buffer_for_listener}'")
-                else:
-                    app.logger.debug(f"LoggingStream BS: CBL empty, no change.")
-                if verbose_logging_enabled: # Keep verbose for even more detail if needed
-                     app.logger.debug(f"Verbose LoggingStream BS: Context: PLL (len {len(pyte_listener_lines)}): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
-            # Check if it's a printable char (not a control character)
-            elif not unicodedata.category(char).startswith('C'):
-                # Unconditional log for character addition
-                app.logger.debug(f"LoggingStream CHAR: Adding char '{char.encode('unicode_escape').decode()}' to CBL. Old CBL: '{current_line_buffer_for_listener}'")
-                current_line_buffer_for_listener += char
-                app.logger.debug(f"LoggingStream CHAR: CBL after adding char: '{current_line_buffer_for_listener}'")
-                if verbose_logging_enabled: # Keep verbose for even more detail if needed
-                    app.logger.debug(f"Verbose LoggingStream CHAR: Context: PLL (len {len(pyte_listener_lines)}): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
-            # Else: it's a control character (like ESC, etc.) not explicitly handled for the log.
-            # It was still processed by super().dispatch() for pyte.Screen.
+        # Now, log the character for our separate line buffer, only if it's a "TEXT" event.
+        if event == "TEXT":
+            if not args: # Should not happen for TEXT event, but good to guard
+                app.logger.warning("LoggingStream: TEXT event received with no args.")
+                return
+            
+            char = args[0] # For "TEXT" event, the character is the first argument
+
+            # All subsequent character processing logic is now conditional on event == "TEXT"
+            # and uses 'char' derived from args[0].
+            with pyte_listener_lock:
+                if char == "\n":
+                    app.logger.debug(f"LoggingStream LF: Appending CBL ('{current_line_buffer_for_listener}') to PLL. Old PLL len: {len(pyte_listener_lines)}")
+                    pyte_listener_lines.append(current_line_buffer_for_listener)
+                    app.logger.debug(f"LoggingStream LF: CBL ('{current_line_buffer_for_listener}') appended. New PLL len: {len(pyte_listener_lines)}. Clearing CBL.")
+                    current_line_buffer_for_listener = ""
+                    app.logger.debug(f"LoggingStream LF: CBL cleared. PLL (last 3): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
+                    if verbose_logging_enabled: # Keep verbose for even more detail if needed
+                        app.logger.debug(f"Verbose LoggingStream LF: Full context: PLL (len {len(pyte_listener_lines)}) is {pyte_listener_lines[-5:] if len(pyte_listener_lines) > 5 else pyte_listener_lines}, CBL is ('{current_line_buffer_for_listener}')")
+                elif char == "\r":
+                    app.logger.debug(f"LoggingStream CR: Appending CBL ('{current_line_buffer_for_listener}') to PLL. Old PLL len: {len(pyte_listener_lines)}")
+                    pyte_listener_lines.append(current_line_buffer_for_listener) # Always append, even if empty
+                    app.logger.debug(f"LoggingStream CR: CBL ('{current_line_buffer_for_listener}') appended. New PLL len: {len(pyte_listener_lines)}. Clearing CBL.")
+                    current_line_buffer_for_listener = ""
+                    app.logger.debug(f"LoggingStream CR: CBL cleared. PLL (last 3): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
+                    if verbose_logging_enabled: # Keep verbose for even more detail if needed
+                        app.logger.debug(f"Verbose LoggingStream CR: Full context: PLL (len {len(pyte_listener_lines)}) is {pyte_listener_lines[-5:] if len(pyte_listener_lines) > 5 else pyte_listener_lines}, CBL is ('{current_line_buffer_for_listener}')")
+                elif char == "\x08":  # Backspace
+                    if current_line_buffer_for_listener:
+                        old_cbl = current_line_buffer_for_listener
+                        current_line_buffer_for_listener = current_line_buffer_for_listener[:-1]
+                        app.logger.debug(f"LoggingStream BS: CBL was '{old_cbl}', now '{current_line_buffer_for_listener}'")
+                    else:
+                        app.logger.debug(f"LoggingStream BS: CBL empty, no change.")
+                    if verbose_logging_enabled: # Keep verbose for even more detail if needed
+                         app.logger.debug(f"Verbose LoggingStream BS: Context: PLL (len {len(pyte_listener_lines)}): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
+                # Check if it's a printable char (not a control character)
+                # This check is implicitly handled by pyte parser giving "TEXT" event for printable chars.
+                # Non-printable chars that are part of control sequences come as other events (CSI, ESC etc.)
+                # So, if event is "TEXT", char is expected to be printable or simple whitespace.
+                elif not unicodedata.category(char).startswith('C'): # Keep this check for robustness with TEXT
+                    # Unconditional log for character addition
+                    app.logger.debug(f"LoggingStream CHAR: Adding char '{char.encode('unicode_escape').decode()}' to CBL. Old CBL: '{current_line_buffer_for_listener}'")
+                    current_line_buffer_for_listener += char
+                    app.logger.debug(f"LoggingStream CHAR: CBL after adding char: '{current_line_buffer_for_listener}'")
+                    if verbose_logging_enabled: # Keep verbose for even more detail if needed
+                        app.logger.debug(f"Verbose LoggingStream CHAR: Context: PLL (len {len(pyte_listener_lines)}): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
+        # Else (if event is not "TEXT"): it's a control sequence (like ESC, CSI, etc.) or other event.
+        # It was already processed by super().dispatch() for pyte.Screen.
+        # We are not logging these non-TEXT events to our custom line buffer.
 
 # --- PTY Reader Thread ---
 def pty_reader_thread_function():
@@ -125,11 +137,12 @@ def pty_reader_thread_function():
                             app.logger.debug(f"PTY Reader: About to call stream.feed(). stream object type: {type(stream)}, stream object: {stream}")
                             if decoded_data: # Ensure there's at least one character for the direct call test
                                 first_char_for_direct_test = decoded_data[0]
-                                app.logger.debug(f"PTY Reader: Attempting DIRECT call to stream.dispatch() with char: '{first_char_for_direct_test.encode('unicode_escape').decode()}'")
+                                # Corrected diagnostic call to use ("TEXT", char)
+                                app.logger.debug(f"PTY Reader: Attempting DIRECT call to stream.dispatch() with event='TEXT', char='{first_char_for_direct_test.encode('unicode_escape').decode()}'")
                                 try:
-                                    stream.dispatch(first_char_for_direct_test) # Direct call for diagnostics
+                                    stream.dispatch("TEXT", first_char_for_direct_test) # Corrected direct call for diagnostics
                                 except Exception as e_direct_dispatch:
-                                    app.logger.error(f"PTY Reader: EXCEPTION during DIRECT call to stream.dispatch(): {e_direct_dispatch}", exc_info=True)
+                                    app.logger.error(f"PTY Reader: EXCEPTION during DIRECT call to stream.dispatch('TEXT', char): {e_direct_dispatch}", exc_info=True)
                             
                             app.logger.debug(f"PTY Reader: Now calling original stream.feed() with all {len(decoded_data)} chars.")
                             stream.feed(decoded_data)
@@ -610,7 +623,8 @@ def main():
 
         # Initialize pyte screen and our custom logging stream
         screen = pyte.Screen(cols, lines)
-        stream = LoggingStream(screen) # Use the custom stream
+        stream = LoggingStream()       # Instantiate LoggingStream without arguments
+        stream.attach(screen)          # Attach the screen as a listener to the stream
         pty_running = True  # Set flag before starting thread
 
         # Start the PTY reader thread
