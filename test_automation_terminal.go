@@ -19,6 +19,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/creack/pty"
 	"github.com/xyproto/vt100"
@@ -192,8 +193,8 @@ func setupPtyAndShell() error {
 
 
 	vtScreen = vt100.NewCanvas()
-	// Resize canvas to default; vt100.NewCanvas() uses MustTermSize() which might not be what we want.
-	vtScreen.ResizeTo(int(defaultPtyCols), int(defaultPtyLines))
+	// Canvas size is determined by vt100.NewCanvas() via MustTermSize().
+	// COLUMNS and LINES env vars are set, which MustTermSize may use as a fallback.
 	vtScreen.Clear() // Clear with default colors
 	vtScreen.SetRunewise(false) // Use faster block drawing if possible
 
@@ -264,14 +265,14 @@ func ptyReader() {
 			} else if char == '\b' { // Backspace
 				if currentLineBuffer.Len() > 0 {
 					oldCBL := currentLineBuffer.String()
-					// Truncate last rune
-					// This is tricky with multi-byte UTF-8. Simpler: just trim last byte.
-					// For robust UTF-8 backspace, convert to []rune, trim, then back to string/bytes.
-					// Here, a simpler byte-wise trim for now.
-					currentLineBuffer.Truncate(currentLineBuffer.Len() - 1)
+					// Truncate last rune. A simple byte-wise trim for now.
+					// For robust UTF-8 backspace, proper rune-wise truncation would be needed.
+					if currentLineBuffer.Len() > 0 {
+						currentLineBuffer.Truncate(currentLineBuffer.Len() - 1)
+					}
 					logDebug("LineCapture BS: CBL was '%s', now '%s'", oldCBL, currentLineBuffer.String())
 				}
-			} else if !vt100.IsControl(char) && !vt100.IsUnsupported(char) { // Simplified check for printable
+			} else if unicode.IsPrint(char) { // Check if the character is printable
 				currentLineBuffer.WriteRune(char)
 				logDebug("LineCapture CHAR: Adding char '%s' to CBL. CBL now: '%s'", string(char), currentLineBuffer.String())
 			}
@@ -281,29 +282,37 @@ func ptyReader() {
 			currentScreenCursorMu.Lock()
 			if vtScreen != nil {
 				if char == '\n' {
-					currentScreenY++
 					currentScreenX = 0
-					if currentScreenY >= vtScreen.Height() { // Scroll up
-						vtScreen.ScrollUp()
-						currentScreenY = vtScreen.Height() - 1
+					if currentScreenY < vtScreen.Height()-1 {
+						currentScreenY++
+					} else {
+						// At the bottom line, effectively overwriting or Plot will ignore if y is out of bounds.
+						// No direct scroll method available in vt100.Canvas to shift content up.
+						logDebug("Screen at bottom, new line will overwrite last line or be ignored by Plot if Y exceeds canvas height.")
 					}
 				} else if char == '\r' {
 					currentScreenX = 0
 				} else if char == '\b' {
 					if currentScreenX > 0 {
 						currentScreenX--
-						vtScreen.Plot(currentScreenX, currentScreenY, ' ') // Erase char
-					}
-				} else if !vt100.IsControl(char) && !vt100.IsUnsupported(char) { // Simplified check for printable
-					if currentScreenX >= vtScreen.Width() { // Line wrap
-						currentScreenY++
-						currentScreenX = 0
-						if currentScreenY >= vtScreen.Height() { // Scroll up
-							vtScreen.ScrollUp()
-							currentScreenY = vtScreen.Height() - 1
+						// Plot a space to erase the character. Ensure Y is within bounds.
+						if currentScreenY < vtScreen.Height() {
+							vtScreen.Plot(currentScreenX, currentScreenY, ' ') 
 						}
 					}
-					vtScreen.PlotColor(currentScreenX, currentScreenY, vt100.Default, char)
+				} else if unicode.IsPrint(char) { // Check if the character is printable
+					if currentScreenX >= vtScreen.Width() { // Line wrap
+						currentScreenX = 0
+						if currentScreenY < vtScreen.Height()-1 {
+							currentScreenY++
+						} else {
+							logDebug("Screen at bottom-right, new char on new line will overwrite last line or be ignored.")
+						}
+					}
+					// Ensure X and Y are within bounds for PlotColor
+					if currentScreenX < vtScreen.Width() && currentScreenY < vtScreen.Height() {
+						vtScreen.PlotColor(currentScreenX, currentScreenY, vt100.Default, char)
+					}
 					currentScreenX++
 				}
 			}
