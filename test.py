@@ -295,13 +295,14 @@ def sigint_handler(sig, frame):
     # Raising KeyboardInterrupt would normally be caught by main's try/except.
     # However, if Flask/Werkzeug interferes with this, a more direct approach is needed.
     
-    log_func("SIGINT handler: Performing direct cleanup and exiting.")
-    cleanup_pty_and_process() # Call cleanup directly.
+    # log_func("SIGINT handler: Performing direct cleanup and exiting.")
+    # cleanup_pty_and_process() # Call cleanup directly.
     
-    # Exit the entire process.
-    # sys.exit(0) attempts a clean exit.
-    # os._exit(0) is a more forceful exit that bypasses most cleanup; use if sys.exit hangs.
-    sys.exit(0)
+    # Re-raise KeyboardInterrupt to allow the main thread's try/except/finally
+    # to execute, which includes calling cleanup_pty_and_process.
+    # This makes the shutdown flow more standard with Flask/Werkzeug.
+    log_func("SIGINT handler: Raising KeyboardInterrupt for main thread shutdown.")
+    raise KeyboardInterrupt
 
 # --- Main Application ---
 def main():
@@ -392,19 +393,19 @@ def main():
         pty_thread = threading.Thread(target=pty_reader_thread_function, daemon=True)
         pty_thread.start()
 
-        # Give bash and pty_reader a moment to initialize and print the first prompt
-        print("Waiting a moment for PTY to initialize...")
-        time.sleep(0.5) # Increased slightly for more reliability
+        # Give shell and pty_reader a moment to initialize and print the first prompt
+        app.logger.info("Waiting a moment for PTY to initialize...")
+        time.sleep(0.5)
 
         # Set up signal handler for Ctrl+C (SIGINT)
         # This should be set up after PTY and process are initialized.
         signal.signal(signal.SIGINT, sigint_handler)
 
-        print(f"Flask server starting on http://127.0.0.1:5399")
-        print("Endpoints:")
-        print("  POST /keystroke (form data: {'keys': 'your_command\\n'})")
-        print("  POST /keystroke_sync (form data: {'keys': 'your_command\\n'})")
-        print("  GET  /screen")
+        app.logger.info(f"Flask server starting on http://127.0.0.1:5399")
+        app.logger.info("Endpoints:")
+        app.logger.info("  POST /keystroke (form data: {'keys': 'your_command\\n'})")
+        app.logger.info("  POST /keystroke_sync (form data: {'keys': 'your_command\\n'})")
+        app.logger.info("  GET  /screen")
         
         # Run Flask web server.
         # use_reloader=False is critical when managing subprocesses and threads.
@@ -416,21 +417,13 @@ def main():
     except Exception as e:
         app.logger.error(f"An unexpected error occurred in main: {e}", exc_info=True)
     finally:
-        # This finally block will run if KeyboardInterrupt is caught by main,
+        # This finally block will run if KeyboardInterrupt is caught by main (now expected due to sigint_handler),
         # or if app.run() exits normally, or if another exception occurs in main's try block.
-        # If sigint_handler calls sys.exit(), this finally block in main might not run.
         app.logger.info("Main finally block reached.")
-        # cleanup_pty_and_process is now primarily called from sigint_handler for Ctrl+C.
-        # Call it here to handle non-Ctrl+C exits or if sigint_handler failed to fully cleanup.
-        # cleanup_pty_and_process should be idempotent.
-        if pty_running: # If pty_running is still true, sigint_handler might not have run or completed.
-            app.logger.info("Main finally block: pty_running is true, ensuring cleanup.")
-            cleanup_pty_and_process()
-        else:
-            # If pty_running is false, cleanup was likely initiated by sigint_handler.
-            # A second call to an idempotent cleanup_pty_and_process is generally safe if needed,
-            # but we rely on the signal handler's call for Ctrl+C.
-            app.logger.info("Main finally block: pty_running is false, cleanup likely handled by sigint_handler or already in progress.")
+        # cleanup_pty_and_process is designed to be idempotent and handles all necessary cleanup.
+        # It will be called here regardless of how the try block exits.
+        app.logger.info("Main finally block: ensuring comprehensive cleanup.")
+        cleanup_pty_and_process()
         app.logger.info("Application finished.")
 
 if __name__ == '__main__':
