@@ -402,7 +402,6 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	commandCompletedNormally := false
 	completionMessage := "Command completion status unknown."
-	var outputSegment []string
 
 	for time.Since(startTime).Seconds() < float64(maxSyncWaitSeconds) {
 		if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
