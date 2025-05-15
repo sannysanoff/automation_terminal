@@ -371,37 +371,21 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 		linesAfter, finalCurrentLine := eventHandler.GetCapturedLinesAndCurrentBuffer()
 
 		outputSegment := linesAfter[len(linesBeforeCommandEffect):]
-		// The finalCurrentLine from eventHandler *is* the current line being built.
-		// If the command produced partial output without a newline, it's in finalCurrentLine.
-		// If the command produced full lines and a new prompt, finalCurrentLine is the new prompt.
-		// We need to decide if the currentBufferBefore (old prompt) should be part of output.
-		// The Python version's logic implies the input keys merge with the current line.
-		// Our eventHandler.Print appends to its internal line buffer.
-		// The `keys` sent are processed by the shell, echoed, and then parsed by eventHandler.
-		// So, `linesBeforeCommandEffect` is up to the prompt. `linesAfter` includes echo + output.
-		// `finalCurrentLine` is the new prompt or unterminated output.
-
-		// If currentBufferBefore was the prompt, and keys were "cmd\n"
-		// linesBefore: ["prompt>"] currentBufferBefore: "prompt>" (if no \n after prompt)
-		// or linesBefore: ["line1", "prompt>"] currentBufferBefore: "prompt>"
-		// After keys: linesAfter might be ["prompt>cmd", "output1", "newprompt>"], finalCurrentLine: "newprompt>"
-		// Output segment should be ["cmd", "output1", "newprompt>"] (if prompt was part of first line)
-		// This needs careful alignment with how pyte_listener_lines are constructed.
-		// For now, a simpler diff:
-		if len(linesBeforeCommandEffect) > 0 && len(linesAfter) > 0 && strings.HasPrefix(linesAfter[len(linesBeforeCommandEffect)-1], linesBeforeCommandEffect[len(linesBeforeCommandEffect)-1]) {
-			// This attempts to handle the case where the command is echoed on the same line as the prompt
-			// For now, let's use the simpler logic as in the main path.
-		}
-
 		if finalCurrentLine != "" {
 			outputSegment = append(outputSegment, finalCurrentLine)
 		}
-
+		joined := strings.Join(outputSegment, "")
 		eventHandler.ResetCapturedLinesAndSetBuffer(finalCurrentLine)
 		logDebug("SYNC (shell exited path): Reset eventHandler captured lines. New buffer: '%s'", finalCurrentLine)
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(KeystrokeSyncResponse{Status: "success", Message: "Shell process exited shortly after command submission.", Output: outputSegment})
+		json.NewEncoder(w).Encode(
+			KeystrokeSyncResponse{
+				Status:  "success",
+				Message: "Shell process exited shortly after command submission.",
+				Output:  joined,
+			},
+		)
 		return
 	}
 
