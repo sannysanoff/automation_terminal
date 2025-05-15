@@ -6,6 +6,7 @@ import select
 import pyte
 import unicodedata # Added for character category checking
 import argparse # Added for command-line arguments
+import logging # Added for setting logger level
 from flask import Flask, request, jsonify
 import threading
 import signal
@@ -502,7 +503,15 @@ def main():
 
     if args.verbose:
         verbose_logging_enabled = True
-        app.logger.info("Verbose logging enabled for LoggingStream.")
+        # Set Flask's logger level to DEBUG to see our verbose logs
+        app.logger.setLevel(logging.DEBUG)
+        app.logger.info("Verbose logging enabled for LoggingStream (app.logger set to DEBUG).")
+    else:
+        # Default Flask logger level is INFO if not in debug mode.
+        # If Flask's debug=True is set, it might default to DEBUG anyway,
+        # but explicitly setting INFO here for non-verbose mode is clearer.
+        app.logger.setLevel(logging.INFO)
+
 
     # PTY dimensions
     cols, lines = 80, 24  # Standard terminal dimensions
