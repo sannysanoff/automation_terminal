@@ -287,10 +287,7 @@ func (h *TermEventHandler) Execute(b byte) error {
 			h.scrollUp(h.scrollTop, h.scrollBottom, 1)
 		}
 	case ansiterm.ANSI_CARRIAGE_RETURN: // Carriage Return (CR, 0x0D)
-		// reset the capture buffer (we’ll capture on LF)
-		h.lineBufferForCapture.Reset()
-		logDebug("EventHandler LineCapture CR (Execute): Resetting CBL")
-		// then do the normal CR behavior
+		// just move cursor to column 0; don’t clear our capture buffer here
 		h.cursorX = 0
 	// SO, SI (Shift Out/In for character sets) - not handled for simple vt100/ansi
 	// Other C0 codes are typically ignored or have specific behaviors not emulated here.

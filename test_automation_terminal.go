@@ -342,9 +342,9 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reset and get fresh state before sending command
-	eventHandler.ResetCapturedLinesAndSetBuffer("")
+	// Capture the current prompt line, then clear only previous captures
 	linesBeforeCommandEffect, currentBufferBefore := eventHandler.GetCapturedLinesAndCurrentBuffer()
+	eventHandler.ResetCapturedLinesAndSetBuffer(currentBufferBefore)
 	logDebug("SYNC: lines_before_command_effect (len %d): %v", len(linesBeforeCommandEffect), linesBeforeCommandEffect)
 	logDebug("SYNC: currentBufferBefore: '%s'", currentBufferBefore)
 
