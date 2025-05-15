@@ -25,6 +25,45 @@ pty_thread = None
 # Flask application
 app = Flask(__name__)
 
+# Maximum wait time for synchronous keystroke command completion (in seconds)
+MAX_SYNC_WAIT_SECONDS = 60
+
+# --- Helper Functions ---
+def count_processes_in_pgroup(pgid):
+    """Counts the number of processes in a given process group using ps."""
+    # Ensure pgid is a positive integer as expected by ps for --pgid
+    if not isinstance(pgid, int) or pgid <= 0:
+        app.logger.error(f"Invalid PGID for counting: {pgid}")
+        return -1 # Indicate an error
+
+    command = ["ps", "-o", "pid", "--no-headers", "--pgid", str(pgid)]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        
+        if result.returncode != 0:
+            # If ps returns non-zero, it could be that the PGID no longer exists.
+            # In this case, 0 processes is the correct count.
+            # stderr might contain "Specified process group NNNN does not exist."
+            if "does not exist" in result.stderr or "no such process" in result.stderr.lower():
+                app.logger.info(f"Process group {pgid} does not exist, assuming 0 processes.")
+                return 0
+            else:
+                app.logger.warning(f"Command '{" ".join(command)}' failed with rc {result.returncode}, stderr: {result.stderr.strip()}")
+                return -1 # Indicate an error
+
+        output_lines = result.stdout.strip().split('\n')
+        # Filter out empty lines that might result from split if stdout is empty
+        valid_pids = [line for line in output_lines if line.strip()]
+        count = len(valid_pids)
+        app.logger.debug(f"Processes in PGID {pgid}: {count}. PIDs: {valid_pids}")
+        return count
+    except FileNotFoundError: # ps command not found
+        app.logger.error(f"'ps' command not found. Cannot count processes.")
+        return -1 
+    except Exception as e:
+        app.logger.error(f"Error counting processes in pgroup {pgid} with 'ps': {e}")
+        return -1
+
 # --- PTY Reader Thread ---
 def pty_reader_thread_function():
     """
@@ -84,6 +123,76 @@ def push_keystroke():
     except OSError as e: # master_fd might be closed
         return jsonify({"error": f"Error writing to PTY: {e}"}), 500
     except Exception as e:
+        return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
+
+@app.route('/keystroke_sync', methods=['POST'])
+def push_keystroke_sync():
+    """
+    Receives keystrokes, writes them to PTY, and waits for the command to complete.
+    Completion is defined as only the initial shell process remaining in its process group.
+    Expects form data: {'keys': 'your_command\\n'}
+    """
+    global master_fd, proc
+    app.logger.info(f"Received POST /keystroke_sync. Form data: {request.form}")
+
+    if not master_fd or not pty_running:
+        app.logger.warning("PTY not active for /keystroke_sync")
+        return jsonify({"error": "PTY not active or not initialized"}), 503
+    
+    if not proc or proc.poll() is not None:
+        app.logger.warning("Shell process not running for /keystroke_sync")
+        return jsonify({"error": "Shell process is not running."}), 503
+
+    try:
+        keys = request.form.get('keys')
+        if keys is None:
+            return jsonify({"error": "Missing 'keys' in form data"}), 400
+        
+        os.write(master_fd, keys.encode('utf-8'))
+        app.logger.info(f"Sent keys for sync: '{keys.strip()}'")
+
+        # Initial sleep to allow the command to start
+        time.sleep(1.0)
+
+        # Check if shell is still running after sending keys and initial sleep
+        if proc.poll() is not None:
+            return jsonify({"status": "success", "message": "Shell process exited shortly after command submission."})
+
+        pgid = os.getpgid(proc.pid)
+        app.logger.info(f"Waiting for command completion in PGID {pgid} (shell PID: {proc.pid}). Max wait: {MAX_SYNC_WAIT_SECONDS}s.")
+
+        start_time = time.time()
+        while time.time() - start_time < MAX_SYNC_WAIT_SECONDS:
+            if proc.poll() is not None: # Shell itself exited
+                app.logger.info(f"Shell process (PID: {proc.pid}, PGID: {pgid}) exited during wait.")
+                return jsonify({"status": "success", "message": "Shell process exited during command execution."})
+
+            current_process_count = count_processes_in_pgroup(pgid)
+            app.logger.debug(f"Polling PGID {pgid}: {current_process_count} processes.")
+
+            if current_process_count == 1: # Only the shell itself remains
+                app.logger.info(f"Command completed in PGID {pgid}. Only shell process found.")
+                return jsonify({"status": "success", "message": "Command completed."})
+            elif current_process_count == 0: # PGID became empty (shell exited)
+                app.logger.info(f"Process group {pgid} became empty. Shell likely exited.")
+                return jsonify({"status": "success", "message": "Shell process group became empty, command considered complete."})
+            elif current_process_count < 0: # Error in counting
+                app.logger.error(f"Error counting processes for PGID {pgid}.")
+                return jsonify({"status": "error", "message": "Failed to count processes in process group."}), 500
+            
+            time.sleep(0.5) # Polling interval
+
+        app.logger.warning(f"Timeout waiting for command completion in PGID {pgid}.")
+        return jsonify({"status": "timeout", "message": f"Command did not complete within {MAX_SYNC_WAIT_SECONDS} seconds."}), 503
+
+    except ProcessLookupError: # os.getpgid(proc.pid) if proc died race condition
+        app.logger.error("Shell process disappeared unexpectedly during /keystroke_sync.")
+        return jsonify({"status": "error", "message": "Shell process disappeared unexpectedly."}), 500
+    except OSError as e: # master_fd might be closed or other OS error
+        app.logger.error(f"OSError during /keystroke_sync: {e}")
+        return jsonify({"error": f"Error interacting with PTY: {e}"}), 500
+    except Exception as e:
+        app.logger.error(f"Unexpected error in /keystroke_sync: {e}", exc_info=True)
         return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
 
 @app.route('/screen', methods=['GET'])
@@ -260,6 +369,7 @@ def main():
         print(f"Flask server starting on http://127.0.0.1:5399")
         print("Endpoints:")
         print("  POST /keystroke (form data: {'keys': 'your_command\\n'})")
+        print("  POST /keystroke_sync (form data: {'keys': 'your_command\\n'})")
         print("  GET  /screen")
         
         # Run Flask web server.
