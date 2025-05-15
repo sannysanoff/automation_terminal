@@ -130,6 +130,13 @@ func setupPtyAndShell() error {
 		shellArgs = append(shellArgs, "--norc", "--noprofile", "-i")
 		envMap["PS1"] = "[vm:\\w] \\$ "
 		envMap["PROMPT_COMMAND"] = ""
+	case "sh":
+		logInfo("Configuring for sh: %s", shellPath)
+		// force interactive sh
+		shellArgs = append(shellArgs, "-i")
+		// PS1 with an incrementing command‐count (\#), literal "vm" and cwd (\w)
+		envMap["PS1"] = "[\\#:vm:\\w] \\$ "
+		envMap["PROMPT_COMMAND"] = ""
 	default:
 		logInfo("Configuring for generic shell (%s): %s", shellName, shellPath)
 		shellArgs = append(shellArgs, "-i")
