@@ -173,8 +173,10 @@ func setupPtyAndShell() error {
 	shellCmd.SysProcAttr.Setsid = true
 	// Setctty is also important for making the PTY its controlling terminal.
 	// On Linux, Ctty should be the FD of the slave PTY.
+	// When Stdin/Stdout/Stderr are set to the tty, explicitly setting Ctty can cause issues.
+	// The kernel should infer the controlling TTY from FD 0 if it's a TTY.
 	shellCmd.SysProcAttr.Setctty = true
-	shellCmd.SysProcAttr.Ctty = int(tty.Fd())
+	// shellCmd.SysProcAttr.Ctty = int(tty.Fd()) // This line is removed.
 
 
 	err = shellCmd.Start()
