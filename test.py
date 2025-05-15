@@ -49,6 +49,11 @@ class LoggingStream(pyte.Stream):
         # Uses global pyte_listener_lines, current_line_buffer_for_listener, and pyte_listener_lock
 
     def dispatch(self, char: str) -> None:
+        # Log entry into dispatch, and the character being processed (escaped for readability)
+        # This log is NOT conditional on verbose_logging_enabled to ensure we see if dispatch is called.
+        # We also log the perceived state of verbose_logging_enabled from within this method.
+        app.logger.debug(f"LoggingStream.dispatch entered: char='{char.encode('unicode_escape').decode()}', verbose_enabled_in_dispatch={verbose_logging_enabled}")
+
         # Let pyte.Stream handle the character first for screen updates
         # This ensures screen.display and screen.cursor are up-to-date
         super().dispatch(char)
