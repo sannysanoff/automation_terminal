@@ -529,7 +529,7 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 	// 4. The new prompt
 	
 	// Start with empty output
-	outputSegment := make([]string, 0)
+	outputSegment = make([]string, 0)
 	
 	// If we had a current buffer (prompt) before sending command, include it
 	if currentBufferBefore != "" {
