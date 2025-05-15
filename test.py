@@ -69,12 +69,10 @@ class LoggingStream(pyte.Stream):
                 if verbose_logging_enabled:
                     app.logger.debug(f"Verbose LoggingStream: Cleared current_line_buffer_for_listener after LF.")
             elif char == "\r":
-                # Carriage return: current line is considered finished or will be overwritten.
-                # Log it if it has content, then clear buffer for subsequent characters.
-                if current_line_buffer_for_listener: # Log what was there before CR
-                    if verbose_logging_enabled:
-                        app.logger.debug(f"Verbose LoggingStream: Adding line on CR: '{current_line_buffer_for_listener}'")
-                    pyte_listener_lines.append(current_line_buffer_for_listener)
+                # Carriage return: current line is considered finished. Add it to the list.
+                if verbose_logging_enabled:
+                    app.logger.debug(f"Verbose LoggingStream: Adding line on CR: '{current_line_buffer_for_listener}'")
+                pyte_listener_lines.append(current_line_buffer_for_listener) # Always append, even if empty
                 current_line_buffer_for_listener = ""
                 if verbose_logging_enabled:
                     app.logger.debug(f"Verbose LoggingStream: Cleared current_line_buffer_for_listener after CR.")
@@ -323,22 +321,11 @@ def push_keystroke_sync():
             if final_current_line: # Add the last incomplete line (new prompt, or partial output)
                 output_segment.append(final_current_line)
 
-            # Reset log for the next command: keep only the new prompt line
-            if final_current_line:
-                pyte_listener_lines = [final_current_line]
-                current_line_buffer_for_listener = ""
-            else:
-                # If final_current_line is empty, it means the last output ended with \n or \r.
-                # The last entry in pyte_listener_lines (if any) would be that line.
-                if pyte_listener_lines: # Check if list is not empty
-                    # If lines_after_command_effect is not empty, its last element is the last complete line
-                    if lines_after_command_effect:
-                         pyte_listener_lines = [lines_after_command_effect[-1]]
-                    else: # Edge case: log was empty, current line empty.
-                         pyte_listener_lines = []
-                else: # Log was already empty.
-                    pyte_listener_lines = []
-                current_line_buffer_for_listener = ""
+            # Reset log for the next command: the new prompt (or lack thereof) is in final_current_line.
+            # pyte_listener_lines should be empty as all lines up to the new prompt have been consumed.
+            # current_line_buffer_for_listener should hold the new prompt.
+            current_line_buffer_for_listener = final_current_line
+            pyte_listener_lines = []
         
         return jsonify({"status": result_status, "message": completion_message, "output": output_segment}), status_code
 
@@ -350,9 +337,9 @@ def push_keystroke_sync():
             final_current_line = current_line_buffer_for_listener
             output_segment = lines_after_command_effect[len(lines_before_command_effect):] # Use previously captured lines_before_command_effect
             if final_current_line: output_segment.append(final_current_line)
-            # Reset log
-            if final_current_line: pyte_listener_lines = [final_current_line]; current_line_buffer_for_listener = ""
-            else: pyte_listener_lines = []; current_line_buffer_for_listener = ""
+            # Reset log consistent with the main path
+            current_line_buffer_for_listener = final_current_line
+            pyte_listener_lines = []
         return jsonify({"status": "error", "message": "Shell process disappeared unexpectedly.", "output": output_segment}), 500
     except OSError as e: # os.write, or other os calls if PTY state is bad
         app.logger.error(f"OSError during /keystroke_sync: {e}")
