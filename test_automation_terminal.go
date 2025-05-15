@@ -51,6 +51,10 @@ var (
 	maxSyncWaitSeconds    int = 60 // Maximum wait time for synchronous keystroke command completion
 	defaultPtyCols        uint = 80
 	defaultPtyLines       uint = 25 // Changed from 24 to 25
+
+	// Default colors for plotting and clearing
+	defaultFg = vt100.Default
+	defaultBg = vt100.DefaultBackground
 )
 
 // --- Structs for HTTP responses ---
@@ -263,71 +267,90 @@ func ptyReader() {
 			char := r
 			logDebug("PTY Read char: '%s' (rune: %U)", string(char), char)
 
-			// Update captured lines (for /keystroke_sync)
+			// Update captured lines (for /keystroke_sync) - This logic remains the same
 			capturedLinesMu.Lock()
 			if char == '\n' {
 				capturedLines = append(capturedLines, currentLineBuffer.String())
 				logDebug("LineCapture LF: Appending CBL ('%s') to PLL. Old PLL len: %d. New PLL len: %d. Clearing CBL.", currentLineBuffer.String(), len(capturedLines)-1, len(capturedLines))
 				currentLineBuffer.Reset()
 			} else if char == '\r' {
-				// Often \r is followed by \n or overwrites current line.
-				// For simplicity, treat \r like \n for line capture, or just reset buffer pos.
-				// Python version appended and cleared. Let's do the same.
 				capturedLines = append(capturedLines, currentLineBuffer.String())
 				logDebug("LineCapture CR: Appending CBL ('%s') to PLL. Old PLL len: %d. New PLL len: %d. Clearing CBL.", currentLineBuffer.String(), len(capturedLines)-1, len(capturedLines))
 				currentLineBuffer.Reset()
 			} else if char == '\b' { // Backspace
 				if currentLineBuffer.Len() > 0 {
 					oldCBL := currentLineBuffer.String()
-					// Truncate last rune. A simple byte-wise trim for now.
-					// For robust UTF-8 backspace, proper rune-wise truncation would be needed.
 					if currentLineBuffer.Len() > 0 {
 						currentLineBuffer.Truncate(currentLineBuffer.Len() - 1)
 					}
 					logDebug("LineCapture BS: CBL was '%s', now '%s'", oldCBL, currentLineBuffer.String())
 				}
-			} else if unicode.IsPrint(char) { // Check if the character is printable
+			} else if unicode.IsPrint(char) {
 				currentLineBuffer.WriteRune(char)
 				logDebug("LineCapture CHAR: Adding char '%s' to CBL. CBL now: '%s'", string(char), currentLineBuffer.String())
 			}
 			capturedLinesMu.Unlock()
 
-			// Update vtScreen (for /screen endpoint) - simplified manual plotting
+			// Update vtScreen (for /screen endpoint) - Enhanced manual plotting with scrolling and clearing
 			currentScreenCursorMu.Lock()
 			if vtScreen != nil {
+				// Helper: Clears a line in the viewport from xStart to end
+				clearLineInViewport := func(y uint, xStart uint) {
+					if y >= defaultPtyLines {
+						return
+					}
+					for x := xStart; x < defaultPtyCols; x++ {
+						vtScreen.WriteRuneB(x, y, defaultFg, defaultBg, ' ')
+					}
+				}
+
+				// Helper: Scrolls the viewport content up by one line
+				scrollViewportUp := func() {
+					for y := uint(0); y < defaultPtyLines-1; y++ {
+						for x := uint(0); x < defaultPtyCols; x++ {
+							r, _ := vtScreen.At(x, y+1) // Reads rune, loses color
+							vtScreen.WriteRuneB(x, y, defaultFg, defaultBg, r)
+						}
+					}
+					clearLineInViewport(defaultPtyLines-1, 0) // Clear the new last line
+				}
+
 				if char == '\n' {
 					currentScreenX = 0
 					if currentScreenY < defaultPtyLines-1 {
 						currentScreenY++
-					} else {
-						// At the bottom line of our virtual 80x25 screen.
-						logDebug("Screen at bottom (defaultPtyLines), new line would effectively scroll or overwrite.")
+						clearLineInViewport(currentScreenY, currentScreenX) // Clear new line from cursor
+					} else { // On the last line, scroll
+						scrollViewportUp()
+						// currentScreenY remains defaultPtyLines-1
+						// currentScreenX is 0 (already set), new last line is cleared by scrollViewportUp
 					}
 				} else if char == '\r' {
 					currentScreenX = 0
-				} else if char == '\b' {
+					// CR does not inherently clear the line in simple terminal models
+				} else if char == '\b' { // Backspace
 					if currentScreenX > 0 {
 						currentScreenX--
-						// Plot a space to erase the character. currentScreenY is within defaultPtyLines.
-						// vtScreen.Plot handles bounds check against its own (larger) dimensions.
-						vtScreen.Plot(currentScreenX, currentScreenY, ' ')
+						// Erase character at new cursor position by writing a space with default colors
+						vtScreen.WriteRuneB(currentScreenX, currentScreenY, defaultFg, defaultBg, ' ')
 					}
-				} else if unicode.IsPrint(char) { // Check if the character is printable
-					if currentScreenX >= defaultPtyCols { // Line wrap based on defaultPtyCols
-						currentScreenX = 0
+				} else if unicode.IsPrint(char) { // Printable character
+					if currentScreenX >= defaultPtyCols { // Line wrap
+						currentScreenX = 0 // Move to start of next line
 						if currentScreenY < defaultPtyLines-1 {
 							currentScreenY++
-						} else {
-							logDebug("Screen at bottom-right (defaultPtyLines/Cols), new char on new line would effectively scroll or overwrite.")
+							clearLineInViewport(currentScreenY, currentScreenX) // Clear new line
+						} else { // Wrap on the last line, scroll
+							scrollViewportUp()
+							// currentScreenY remains defaultPtyLines-1
+							// currentScreenX is 0, new line is cleared
 						}
 					}
-					// Plot if current virtual cursor is within the 80x25 virtual screen.
-					// vtScreen.PlotColor handles actual bounds check against its own (larger) dimensions.
-					if currentScreenX < defaultPtyCols && currentScreenY < defaultPtyLines {
-						vtScreen.PlotColor(currentScreenX, currentScreenY, vt100.Default, char)
-					}
-					currentScreenX++ // Increment virtual cursor X
+					// Plot the character using defined default foreground and background
+					vtScreen.WriteRuneB(currentScreenX, currentScreenY, defaultFg, defaultBg, char)
+					currentScreenX++ // Advance cursor
 				}
+				// Non-printable, non-control characters (like null) are skipped for screen plotting
 			}
 			currentScreenCursorMu.Unlock()
 		}
