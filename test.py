@@ -307,44 +307,76 @@ def sigint_handler(sig, frame):
 def main():
     global master_fd, slave_fd, proc, screen, stream, pty_running, pty_thread
 
-    # PTY dimensions and environment variables
+    # PTY dimensions
     cols, lines = 80, 24  # Standard terminal dimensions
+    
+    # Base environment for the PTY, common to all shells
     env = os.environ.copy()
     env.update({
-        "TERM": "vt100",  # A simple terminal type
+        "TERM": "vt100",        # A simple terminal type
         "COLUMNS": str(cols),
         "LINES": str(lines),
-        "PS1": "[PTY]\\$ ",  # A simple, predictable prompt for bash
-        "PROMPT_COMMAND": "", # Avoids potential escape codes from default PROMPT_COMMAND
+        # Set a very basic PATH to avoid issues with user's PATH causing unexpected behavior
+        # and to ensure common commands are found. Adjust if specific paths are needed.
+        "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "C",            # Use a simple locale to avoid complex char issues
+        "LC_ALL": "C",
     })
+
+    # Determine the shell to use and customize args/env
+    shell_path = os.environ.get("SHELL", "/bin/bash") # Default to /bin/bash
+    shell_name = os.path.basename(shell_path)
+    
+    shell_args_for_popen = [shell_path] # The first argument is the shell executable
+
+    # Customize arguments and environment based on the shell type
+    # The goal is to get a simple, interactive shell without user-specific rc files.
+    if shell_name == "zsh":
+        app.logger.info(f"Configuring for zsh: {shell_path}")
+        # -f: Start Zsh without sourcing .zshrc or other startup files.
+        # -i: Force interactive mode.
+        shell_args_for_popen.extend(["-f", "-i"])
+        env["PROMPT"] = "[PTY-ZSH]$ " # Simple prompt for zsh
+        # Zsh might still try to source global rc files (/etc/zsh*), -f primarily targets user files.
+    elif shell_name == "bash":
+        app.logger.info(f"Configuring for bash: {shell_path}")
+        # --norc: Do not read and execute the personal initialization file ~/.bashrc.
+        # --noprofile: Do not read system-wide or personal profile initialization files.
+        # -i: Force interactive mode.
+        shell_args_for_popen.extend(["--norc", "--noprofile", "-i"])
+        env["PS1"] = "[PTY-BASH]$ " # Simple prompt for bash
+        # PROMPT_COMMAND can also affect bash prompts, ensure it's empty.
+        env["PROMPT_COMMAND"] = "" 
+    else: # For other shells (e.g., sh, dash, ksh)
+        app.logger.info(f"Configuring for generic shell ({shell_name}): {shell_path}")
+        # Attempt interactive mode. Startup file skipping varies by shell.
+        shell_args_for_popen.append("-i") 
+        env["PS1"] = f"[PTY-{shell_name.upper()}]$ " # Generic PS1
+
+    app.logger.info(f"Shell command for Popen: {shell_args_for_popen}")
+    app.logger.info(f"Shell environment for Popen (selected keys): "
+                    f"TERM={env.get('TERM')}, PS1={env.get('PS1')}, PROMPT={env.get('PROMPT')}, "
+                    f"PROMPT_COMMAND={env.get('PROMPT_COMMAND')}, LANG={env.get('LANG')}")
 
     try:
         # Create a new PTY
-        # master_fd is for the parent (this script)
-        # slave_fd_temp is for the child process (bash)
         master_fd_temp, slave_fd_temp = pty.openpty()
         
-        # Assign to globals *after* successful creation
         master_fd = master_fd_temp
         slave_fd = slave_fd_temp # Store parent's copy of slave FD for cleanup
 
-        # Determine the shell to use
-        shell_cmd = os.environ.get("SHELL", "/bin/bash") # Default to /bin/bash if $SHELL is not set
-        print(f"Using shell: {shell_cmd}")
-
         # Start the shell in the PTY.
-        # -i for interactive mode (if supported by the shell).
         # preexec_fn=os.setsid makes the shell a new session leader, crucial for os.killpg.
         proc = subprocess.Popen(
-            [shell_cmd, "-i"], # Attempt to run in interactive mode
-            stdin=slave_fd,  # Use the slave FD for shell's stdio
+            shell_args_for_popen, # Use the customized arguments
+            stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
-            env=env,
-            close_fds=True,   # Close other FDs in child, except 0,1,2 which are set by stdin/out/err
+            env=env, # Use the customized environment
+            close_fds=True,
             preexec_fn=os.setsid
         )
-        print(f"Shell process ({shell_cmd}) started with PID: {proc.pid}, PGID: {os.getpgid(proc.pid)}")
+        app.logger.info(f"Shell process ({shell_path}) started with PID: {proc.pid}, PGID: {os.getpgid(proc.pid)}")
 
         # After Popen, the child has its stdio connected to its end of the PTY.
         # The parent's copy of slave_fd is not directly used for read/write by the parent,
