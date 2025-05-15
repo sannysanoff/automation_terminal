@@ -5,6 +5,7 @@ import subprocess
 import select
 import pyte
 import unicodedata # Added for character category checking
+import argparse # Added for command-line arguments
 from flask import Flask, request, jsonify
 import threading
 import signal
@@ -22,6 +23,9 @@ stream = None # pyte stream
 pty_running = True
 # PTY reader thread object
 pty_thread = None
+
+# --- Global for verbose logging ---
+verbose_logging_enabled = False
 
 # --- Globals for capturing terminal output lines ---
 # Stores complete lines captured from the PTY stream
@@ -49,23 +53,35 @@ class LoggingStream(pyte.Stream):
         super().dispatch(char)
 
         # Now, log the character for our separate line buffer
-        global current_line_buffer_for_listener, pyte_listener_lines, pyte_listener_lock
+        global current_line_buffer_for_listener, pyte_listener_lines, pyte_listener_lock, verbose_logging_enabled
         with pyte_listener_lock:
             if char == "\n":
+                if verbose_logging_enabled:
+                    app.logger.debug(f"Verbose LoggingStream: Adding line on LF: '{current_line_buffer_for_listener}'")
                 pyte_listener_lines.append(current_line_buffer_for_listener)
                 current_line_buffer_for_listener = ""
+                if verbose_logging_enabled:
+                    app.logger.debug(f"Verbose LoggingStream: Cleared current_line_buffer_for_listener after LF.")
             elif char == "\r":
                 # Carriage return: current line is considered finished or will be overwritten.
                 # Log it if it has content, then clear buffer for subsequent characters.
                 if current_line_buffer_for_listener: # Log what was there before CR
+                    if verbose_logging_enabled:
+                        app.logger.debug(f"Verbose LoggingStream: Adding line on CR: '{current_line_buffer_for_listener}'")
                     pyte_listener_lines.append(current_line_buffer_for_listener)
-                current_line_buffer_for_listener = "" 
+                current_line_buffer_for_listener = ""
+                if verbose_logging_enabled:
+                    app.logger.debug(f"Verbose LoggingStream: Cleared current_line_buffer_for_listener after CR.")
             elif char == "\x08":  # Backspace
                 if current_line_buffer_for_listener:
                     current_line_buffer_for_listener = current_line_buffer_for_listener[:-1]
+                    if verbose_logging_enabled:
+                        app.logger.debug(f"Verbose LoggingStream: current_line_buffer after BS: '{current_line_buffer_for_listener}'")
             # Check if it's a printable char (not a control character)
             elif not unicodedata.category(char).startswith('C'):
                 current_line_buffer_for_listener += char
+                if verbose_logging_enabled:
+                    app.logger.debug(f"Verbose LoggingStream: current_line_buffer after char '{char.encode('unicode_escape').decode()}': '{current_line_buffer_for_listener}'")
             # Else: it's a control character (like ESC, etc.) not explicitly handled for the log.
             # It was still processed by super().dispatch() for pyte.Screen.
 
@@ -478,7 +494,15 @@ def sigint_handler(sig, frame):
 
 # --- Main Application ---
 def main():
-    global master_fd, slave_fd, proc, screen, stream, pty_running, pty_thread
+    global master_fd, slave_fd, proc, screen, stream, pty_running, pty_thread, verbose_logging_enabled
+
+    parser = argparse.ArgumentParser(description="Run a PTY-backed shell with Flask API.")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging of PTY stream processing.")
+    args = parser.parse_args()
+
+    if args.verbose:
+        verbose_logging_enabled = True
+        app.logger.info("Verbose logging enabled for LoggingStream.")
 
     # PTY dimensions
     cols, lines = 80, 24  # Standard terminal dimensions
