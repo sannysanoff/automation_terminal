@@ -284,6 +284,13 @@ func ptyReader() {
 	logInfo("PTY reader goroutine exited.")
 }
 
+type OOBExecResponse struct {
+	Stdout  string `json:"stdout"`
+	Stderr  string `json:"stderr"`
+	Error   string `json:"error,omitempty"`
+	Timeout bool   `json:"timeout,omitempty"`
+}
+
 // --- HTTP Handlers ---
 func keystrokeHandler(w http.ResponseWriter, r *http.Request) {
 	logInfo("Received POST /keystroke. Form data: %v", r.Form)
@@ -758,6 +765,64 @@ func min(a, b int) int {
 	return b
 }
 
+// --- Out-of-band exec handler ---
+func oobExecHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error": "POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, `{"error": "Failed to parse form data"}`, http.StatusBadRequest)
+		return
+	}
+	cmdStr := r.FormValue("cmd")
+	if cmdStr == "" {
+		http.Error(w, `{"error": "Missing 'cmd' in form data"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Split command for exec.Command. Use "sh -c" for shell features.
+	cmd := exec.Command("sh", "-c", cmdStr)
+	// Set working directory to current directory of Go process (default)
+	// (No need to set cmd.Dir)
+
+	var stdoutBuf, stderrBuf strings.Builder
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Run()
+	}()
+
+	timeout := 10 * time.Second
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(timeout):
+		_ = cmd.Process.Kill()
+		<-done // Wait for process to exit
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(OOBExecResponse{
+			Stdout:  stdoutBuf.String(),
+			Stderr:  stderrBuf.String(),
+			Error:   "timeout",
+			Timeout: true,
+		})
+		return
+	}
+
+	resp := OOBExecResponse{
+		Stdout: stdoutBuf.String(),
+		Stderr: stderrBuf.String(),
+	}
+	if err != nil {
+		resp.Error = err.Error()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
 // --- Cleanup Function ---
 func cleanup() {
 	logInfo("Initiating cleanup...")
@@ -883,6 +948,7 @@ func main() {
 	mux.HandleFunc("/keystroke", keystrokeHandler)
 	mux.HandleFunc("/keystroke_sync", keystrokeSyncHandler)
 	mux.HandleFunc("/screen", screenHandler)
+	mux.HandleFunc("/oob_exec", oobExecHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			logWarn("Invalid URL accessed: %s", r.URL.Path)
@@ -890,7 +956,7 @@ func main() {
 			return
 		}
 		// Could serve a simple help page or redirect
-		fmt.Fprintln(w, "PTY Automation Server running. Endpoints: /keystroke, /keystroke_sync, /screen")
+		fmt.Fprintln(w, "PTY Automation Server running. Endpoints: /keystroke, /keystroke_sync, /screen, /oob_exec")
 	})
 
 	// Attempt to set host TTY to a sane state
