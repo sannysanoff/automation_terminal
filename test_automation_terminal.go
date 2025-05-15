@@ -488,32 +488,40 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 				}
 				logWarn("pstree command for PID %d failed: %v. Output: %s. Assuming command still running or error with pstree.", shellPID, pstreeErr, string(pstreeOut))
 			}
-		} else if runtime.GOOS == "linux" { // Linux specific
-			logDebug("Using tcgetpgrp on slave FD %d for Linux platform (Shell PGID: %d).", ptySlaveForTcgetpgrp.Fd(), shellPGID)
-			currentForegroundPGID, err := unix.Tcgetpgrp(int(ptySlaveForTcgetpgrp.Fd()))
+		} else if runtime.GOOS == "linux" { // Linux specific: check for child processes
+			logDebug("Using ps/awk to check for children of shell PID %d on Linux.", shellPID)
+			// Command: ps -o pid,ppid,comm -ax | awk '$2 == <shellPID> {print $1}'
+			// We need to run this as a shell pipeline or construct it carefully with Go's exec.
+			// Using sh -c for simplicity here.
+			psCmd := fmt.Sprintf("ps -o pid,ppid,comm -ax | awk '$2 == %d {print $1}'", shellPID)
+			cmd := exec.Command("sh", "-c", psCmd)
+			
+			output, err := cmd.Output()
 			if err != nil {
-				var errno syscall.Errno
-				if errors.As(err, &errno) {
-					logError("Error calling tcgetpgrp on slave_fd (%d): %v (errno: %d). Assuming command finished or error.", ptySlaveForTcgetpgrp.Fd(), err, errno)
-				} else {
-					logError("Error calling tcgetpgrp on slave_fd (%d): %v. Assuming command finished or error.", ptySlaveForTcgetpgrp.Fd(), err)
-				}
-
+				// If the command fails (e.g. awk not found, or ps error), check if shell exited.
 				if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
-					completionMessage = "Shell process exited, PTY state uncertain after tcgetpgrp error."
+					logInfo("Shell process (PID: %d) exited (detected after ps/awk command failure).", shellPID)
+					completionMessage = "Shell process exited (detected after ps/awk command failure)."
 					commandCompletedNormally = true
 					break
 				}
-				w.WriteHeader(http.StatusInternalServerError)
-				json.NewEncoder(w).Encode(KeystrokeSyncResponse{Status: "error", Message: fmt.Sprintf("Error checking PTY foreground process group: %v", err)})
-				return
-			}
-			logDebug("Polling PTY's foreground PGID: %d. Shell's PGID: %d.", currentForegroundPGID, shellPGID)
-			if currentForegroundPGID == shellPGID {
-				logInfo("Shell (PGID %d) is foreground process group on PTY. Command considered complete.", shellPGID)
-				completionMessage = "Command completed."
-				commandCompletedNormally = true
-				break
+				logWarn("ps/awk command for PID %d failed: %v. Output: %s. Assuming command still running or error with command.", shellPID, err, string(output))
+				// Unlike tcgetpgrp error which might indicate a PTY issue, this is more likely a tool issue.
+				// We could let it timeout, or return an error. For now, let it continue and potentially timeout.
+				// If critical, an error response could be sent:
+				// w.WriteHeader(http.StatusInternalServerError)
+				// json.NewEncoder(w).Encode(KeystrokeSyncResponse{Status: "error", Message: fmt.Sprintf("Error checking child processes: %v", err)})
+				// return
+			} else {
+				trimmedOutput := strings.TrimSpace(string(output))
+				logDebug("ps/awk output for children of PID %d: '%s'", shellPID, trimmedOutput)
+				if trimmedOutput == "" { // No child PIDs printed
+					logInfo("Linux ps/awk check: Shell PID %d has no children. Command complete.", shellPID)
+					completionMessage = "Command completed (Linux ps/awk check)."
+					commandCompletedNormally = true
+					break
+				}
+				// If there's output, children exist, command is still running.
 			}
 		} else { // Other Unix-like systems or unsupported
 			logWarn("Synchronous keystroke completion check is not implemented for this platform: %s. Assuming command completed.", runtime.GOOS)
