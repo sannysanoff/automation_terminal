@@ -57,10 +57,10 @@ type KeystrokeResponse struct {
 }
 
 type KeystrokeSyncResponse struct {
-	Status  string   `json:"status"`
-	Message string   `json:"message"`
-	Output  []string `json:"output,omitempty"`
-	Error   string   `json:"error,omitempty"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	Output  string `json:"output,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 type ScreenResponse struct {
@@ -527,38 +527,19 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 	logDebug("SYNC: lines_after_command_effect (len %d): %v", len(linesAfterCommandEffect), linesAfterCommandEffect)
 	logDebug("SYNC: final_current_line: '%s'", finalCurrentLine)
 
-	// Construct complete output including:
-	// 1. The prompt line before command
-	// 2. The command echo (if any)
-	// 3. The command output
-	// 4. The new prompt
-
-	// Start with empty output
-	outputSegment = make([]string, 0)
-
-	// If we had a current buffer (prompt) before sending command, include it
-	if currentBufferBefore != "" {
-		outputSegment = append(outputSegment, currentBufferBefore)
+	// Build one string: echo+output + next prompt
+	joined := strings.Join(linesAfterCommandEffect, "")
+	if finalCurrentLine != "" {
+		joined += finalCurrentLine
 	}
-
-	// Include all new lines captured after sending command
-	outputSegment = append(outputSegment, linesAfterCommandEffect...)
-
-	// Include the final current line only if it's not empty
-	// This prevents duplicate prompts when we have complete lines
-	if finalCurrentLine != "" && (len(outputSegment) == 0 ||
-		!strings.HasSuffix(outputSegment[len(outputSegment)-1], "\n")) {
-		outputSegment = append(outputSegment, finalCurrentLine)
-	}
-
-	// Reset capture for next command, keeping only the new prompt
+	// Reset capture for next command (keep only the new prompt)
 	eventHandler.ResetCapturedLinesAndSetBuffer(finalCurrentLine)
-	logDebug("SYNC: Reset eventHandler captured lines. New buffer: '%s'", finalCurrentLine)
-
-	logDebug("SYNC: Returning output_segment (len %d): %v", len(outputSegment), outputSegment)
+	logDebug("SYNC: Returning joined output: %q", joined)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(httpStatusCode)
-	json.NewEncoder(w).Encode(KeystrokeSyncResponse{Status: status, Message: completionMessage, Output: outputSegment})
+	json.NewEncoder(w).Encode(
+		KeystrokeSyncResponse{Status: status, Message: completionMessage, Output: joined},
+	)
 }
 
 func screenHandler(w http.ResponseWriter, r *http.Request) {
