@@ -386,8 +386,8 @@ def push_keystroke_sync():
             # Reset log for the next command: the new prompt (or lack thereof) is in final_current_line.
             # pyte_listener_lines should be empty as all lines up to the new prompt have been consumed.
             # current_line_buffer_for_listener should hold the new prompt.
-            current_line_buffer_for_listener = final_current_line
-            pyte_listener_lines = []
+            current_line_buffer_for_listener = final_current_line # Preserves/updates the "current" line
+            pyte_listener_lines = []                              # Clears the "lines buffer"
         
         app.logger.debug(f"SYNC: Returning output_segment: {output_segment}")
         return jsonify({"status": result_status, "message": completion_message, "output": output_segment}), status_code
