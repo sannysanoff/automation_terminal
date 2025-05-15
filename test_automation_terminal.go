@@ -979,7 +979,7 @@ func main() {
 		}
 	}
 
-	serverAddr := "127.0.0.1:5399"
+	serverAddr := ":5399"
 	logInfo("Starting HTTP server on %s", serverAddr)
 	logInfo("Endpoints:")
 	logInfo("  POST /keystroke (form data: {'keys': 'your_command\\n'})")
