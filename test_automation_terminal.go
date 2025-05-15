@@ -285,10 +285,11 @@ func ptyReader() {
 }
 
 type OOBExecResponse struct {
-	Stdout  string `json:"stdout"`
-	Stderr  string `json:"stderr"`
-	Error   string `json:"error,omitempty"`
-	Timeout bool   `json:"timeout,omitempty"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	Error    string `json:"error,omitempty"`
+	Timeout  bool   `json:"timeout,omitempty"`
+	ExitCode int    `json:"exit_code"`
 }
 
 // --- HTTP Handlers ---
@@ -797,24 +798,33 @@ func oobExecHandler(w http.ResponseWriter, r *http.Request) {
 
 	timeout := 10 * time.Second
 	var err error
+	var exitCode int
 	select {
 	case err = <-done:
+		if cmd.ProcessState != nil {
+			exitCode = cmd.ProcessState.ExitCode()
+		} else {
+			exitCode = -1
+		}
 	case <-time.After(timeout):
 		_ = cmd.Process.Kill()
 		<-done // Wait for process to exit
+		exitCode = -1
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(OOBExecResponse{
-			Stdout:  stdoutBuf.String(),
-			Stderr:  stderrBuf.String(),
-			Error:   "timeout",
-			Timeout: true,
+			Stdout:   stdoutBuf.String(),
+			Stderr:   stderrBuf.String(),
+			Error:    "timeout",
+			Timeout:  true,
+			ExitCode: exitCode,
 		})
 		return
 	}
 
 	resp := OOBExecResponse{
-		Stdout: stdoutBuf.String(),
-		Stderr: stderrBuf.String(),
+		Stdout:   stdoutBuf.String(),
+		Stderr:   stderrBuf.String(),
+		ExitCode: exitCode,
 	}
 	if err != nil {
 		resp.Error = err.Error()
