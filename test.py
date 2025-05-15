@@ -9,7 +9,6 @@ import threading
 import signal
 import sys
 import time # Added for sleep
-import platform # For OS detection
 
 # --- Global variables ---
 # PTY and subprocess related
@@ -28,55 +27,6 @@ app = Flask(__name__)
 
 # Maximum wait time for synchronous keystroke command completion (in seconds)
 MAX_SYNC_WAIT_SECONDS = 60
-
-# --- Helper Functions ---
-def count_processes_in_pgroup(pgid):
-    """Counts the number of processes in a given process group using ps."""
-    # Ensure pgid is a positive integer as expected by ps for --pgid
-    if not isinstance(pgid, int) or pgid <= 0:
-        app.logger.error(f"Invalid PGID for counting: {pgid}")
-        return -1 # Indicate an error
-
-    system_os = platform.system()
-    if system_os == "Linux":
-        command = ["ps", "-o", "pid", "--no-headers", "--pgid", str(pgid)]
-    elif system_os == "Darwin": # macOS
-        # On macOS, `ps -g <pgid>` lists processes in the group.
-        # `-o pid=` prints only the PID without a header.
-        command = ["ps", "-o", "pid=", "-g", str(pgid)]
-    else:
-        app.logger.error(f"Unsupported OS for process counting: {system_os}")
-        return -1 # Indicate an error for unsupported OS
-
-    try:
-        app.logger.debug(f"Executing process count command: '{" ".join(command)}'")
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
-        
-        if result.returncode != 0:
-            # If ps returns non-zero, it could be that the PGID no longer exists (common).
-            # Or, for macOS, if the group is empty, `ps -g` might return 1.
-            # We check stderr for specific messages indicating the group doesn't exist or is empty.
-            stderr_lower = result.stderr.lower()
-            if "does not exist" in stderr_lower or "no such process" in stderr_lower or \
-               (system_os == "Darwin" and result.stdout.strip() == "" and result.returncode == 1): # macOS specific for empty group
-                app.logger.info(f"Process group {pgid} appears empty or non-existent. Assuming 0 processes. stderr: {result.stderr.strip()}")
-                return 0
-            else:
-                app.logger.warning(f"Command '{" ".join(command)}' failed with rc {result.returncode}, stderr: {result.stderr.strip()}")
-                return -1 # Indicate an error
-
-        output_lines = result.stdout.strip().split('\n')
-        # Filter out empty lines that might result from split if stdout is empty
-        valid_pids = [line for line in output_lines if line.strip()]
-        count = len(valid_pids)
-        app.logger.debug(f"Processes in PGID {pgid}: {count}. PIDs: {valid_pids}")
-        return count
-    except FileNotFoundError: # ps command not found
-        app.logger.error(f"'ps' command not found. Cannot count processes.")
-        return -1 
-    except Exception as e:
-        app.logger.error(f"Error counting processes in pgroup {pgid} with 'ps': {e}")
-        return -1
 
 # --- PTY Reader Thread ---
 def pty_reader_thread_function():
@@ -144,13 +94,13 @@ def push_keystroke():
 def push_keystroke_sync():
     """
     Receives keystrokes, writes them to PTY, and waits for the command to complete.
-    Completion is defined as only the initial shell process remaining in its process group.
+    Completion is defined as the shell process regaining foreground control of the PTY.
     Expects form data: {'keys': 'your_command\\n'}
     """
-    global master_fd, proc
+    global master_fd, proc, slave_fd # slave_fd is needed for tcgetpgrp
     app.logger.info(f"Received POST /keystroke_sync. Form data: {request.form}")
 
-    if not master_fd or not pty_running:
+    if not master_fd or not pty_running or slave_fd is None:
         app.logger.warning("PTY not active for /keystroke_sync")
         return jsonify({"error": "PTY not active or not initialized"}), 503
     
@@ -171,40 +121,51 @@ def push_keystroke_sync():
 
         # Check if shell is still running after sending keys and initial sleep
         if proc.poll() is not None:
+            app.logger.info("Shell process exited shortly after command submission and initial sleep.")
             return jsonify({"status": "success", "message": "Shell process exited shortly after command submission."})
 
-        pgid = os.getpgid(proc.pid)
-        app.logger.info(f"Waiting for command completion in PGID {pgid} (shell PID: {proc.pid}). Max wait: {MAX_SYNC_WAIT_SECONDS}s.")
+        shell_pid = proc.pid
+        shell_pgid = os.getpgid(shell_pid) # PGID of the shell process itself
+        app.logger.info(f"Waiting for command completion. Shell PID: {shell_pid}, Shell PGID: {shell_pgid}. Max wait: {MAX_SYNC_WAIT_SECONDS}s.")
+        app.logger.debug(f"Using slave FD {slave_fd} for tcgetpgrp checks.")
 
         start_time = time.time()
         while time.time() - start_time < MAX_SYNC_WAIT_SECONDS:
             if proc.poll() is not None: # Shell itself exited
-                app.logger.info(f"Shell process (PID: {proc.pid}, PGID: {pgid}) exited during wait.")
+                app.logger.info(f"Shell process (PID: {shell_pid}) exited during wait.")
                 return jsonify({"status": "success", "message": "Shell process exited during command execution."})
 
-            current_process_count = count_processes_in_pgroup(pgid)
-            app.logger.debug(f"Polling PGID {pgid}: {current_process_count} processes.")
+            try:
+                current_foreground_pgid = os.tcgetpgrp(slave_fd)
+                app.logger.debug(f"Polling PTY's foreground PGID: {current_foreground_pgid}. Shell's PGID: {shell_pgid}.")
+            except OSError as e:
+                # This can happen if slave_fd is no longer valid (e.g., PTY closed, shell exited abruptly)
+                app.logger.error(f"Error calling tcgetpgrp on slave_fd ({slave_fd}): {e}. Assuming command finished or error.")
+                if proc.poll() is not None: # Check again if shell exited
+                     return jsonify({"status": "success", "message": "Shell process exited, PTY state uncertain."})
+                return jsonify({"status": "error", "message": f"Error checking PTY foreground process group: {e}"}), 500
 
-            if current_process_count == 1: # Only the shell itself remains
-                app.logger.info(f"Command completed in PGID {pgid}. Only shell process found.")
+            if current_foreground_pgid == shell_pgid:
+                # The shell's process group is the foreground group on the PTY.
+                # This means the shell is at a prompt, ready for new input.
+                # Any command it launched in the foreground has completed.
+                app.logger.info(f"Shell (PGID {shell_pgid}) is foreground process group on PTY. Command considered complete.")
                 return jsonify({"status": "success", "message": "Command completed."})
-            elif current_process_count == 0: # PGID became empty (shell exited)
-                app.logger.info(f"Process group {pgid} became empty. Shell likely exited.")
-                return jsonify({"status": "success", "message": "Shell process group became empty, command considered complete."})
-            elif current_process_count < 0: # Error in counting
-                app.logger.error(f"Error counting processes for PGID {pgid}.")
-                return jsonify({"status": "error", "message": "Failed to count processes in process group."}), 500
             
             time.sleep(0.5) # Polling interval
 
-        app.logger.warning(f"Timeout waiting for command completion in PGID {pgid}.")
+        app.logger.warning(f"Timeout waiting for command completion (Shell PGID: {shell_pgid} did not become foreground).")
         return jsonify({"status": "timeout", "message": f"Command did not complete within {MAX_SYNC_WAIT_SECONDS} seconds."}), 503
 
-    except ProcessLookupError: # os.getpgid(proc.pid) if proc died race condition
-        app.logger.error("Shell process disappeared unexpectedly during /keystroke_sync.")
+    except ProcessLookupError: # os.getpgid(proc.pid) can fail if proc died just before the call
+        app.logger.error("Shell process disappeared unexpectedly (ProcessLookupError) during /keystroke_sync.")
         return jsonify({"status": "error", "message": "Shell process disappeared unexpectedly."}), 500
-    except OSError as e: # master_fd might be closed or other OS error
+    except OSError as e: # os.write, or other os calls if PTY state is bad
         app.logger.error(f"OSError during /keystroke_sync: {e}")
+        # Check if it's an EIO error, which often means the PTY is gone
+        if e.errno == 5: # EIO (Input/output error)
+            app.logger.warning("OSError EIO, PTY may have been closed. Assuming command/shell exited.")
+            return jsonify({"status": "success", "message": "PTY closed, command assumed complete or shell exited."})
         return jsonify({"error": f"Error interacting with PTY: {e}"}), 500
     except Exception as e:
         app.logger.error(f"Unexpected error in /keystroke_sync: {e}", exc_info=True)
