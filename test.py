@@ -123,6 +123,15 @@ def pty_reader_thread_function():
                         app.logger.debug(f"PTY Read {len(decoded_data)} chars: '{log_snippet}...'")
                         if stream:
                             app.logger.debug(f"PTY Reader: About to call stream.feed(). stream object type: {type(stream)}, stream object: {stream}")
+                            if decoded_data: # Ensure there's at least one character for the direct call test
+                                first_char_for_direct_test = decoded_data[0]
+                                app.logger.debug(f"PTY Reader: Attempting DIRECT call to stream.dispatch() with char: '{first_char_for_direct_test.encode('unicode_escape').decode()}'")
+                                try:
+                                    stream.dispatch(first_char_for_direct_test) # Direct call for diagnostics
+                                except Exception as e_direct_dispatch:
+                                    app.logger.error(f"PTY Reader: EXCEPTION during DIRECT call to stream.dispatch(): {e_direct_dispatch}", exc_info=True)
+                            
+                            app.logger.debug(f"PTY Reader: Now calling original stream.feed() with all {len(decoded_data)} chars.")
                             stream.feed(decoded_data)
                         else:
                             app.logger.warning("PTY Reader: stream object is None. Cannot feed data.")
