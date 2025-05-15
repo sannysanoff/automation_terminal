@@ -255,6 +255,19 @@ func (h *TermEventHandler) Execute(b byte) error {
 			// For simplicity, no wrap on HT here.
 		}
 	case ansiterm.ANSI_LINE_FEED: // Line Feed (LF, 0x0A)
+		// —–– BEGIN line‐capture for /keystroke_sync –––—
+		// append whatever is in the buffer (if non‐empty or first line) + “\n”
+		line := h.lineBufferForCapture.String()
+		if line != "" || len(h.capturedLinesForSync) == 0 {
+			h.capturedLinesForSync = append(h.capturedLinesForSync, line+"\n")
+			logDebug(
+				"EventHandler LineCapture LF (Execute): Appending CBL ('%s') to PLL. New PLL len: %d. Clearing CBL.",
+				line, len(h.capturedLinesForSync),
+			)
+		}
+		h.lineBufferForCapture.Reset()
+		// —–– END line‐capture –––—
+		// now do the normal LF behavior
 		h.cursorY++
 		if h.cursorY > h.scrollBottom {
 			h.cursorY = h.scrollBottom
@@ -274,6 +287,10 @@ func (h *TermEventHandler) Execute(b byte) error {
 			h.scrollUp(h.scrollTop, h.scrollBottom, 1)
 		}
 	case ansiterm.ANSI_CARRIAGE_RETURN: // Carriage Return (CR, 0x0D)
+		// reset the capture buffer (we’ll capture on LF)
+		h.lineBufferForCapture.Reset()
+		logDebug("EventHandler LineCapture CR (Execute): Resetting CBL")
+		// then do the normal CR behavior
 		h.cursorX = 0
 	// SO, SI (Shift Out/In for character sets) - not handled for simple vt100/ansi
 	// Other C0 codes are typically ignored or have specific behaviors not emulated here.
