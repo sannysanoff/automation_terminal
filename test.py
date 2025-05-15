@@ -56,15 +56,15 @@ def pty_reader_thread_function():
                         pty_running = False # Signal to stop, if not already
                         break
                 except OSError:  # Happens if FD is closed by another thread
-                    print("PTY read error (FD likely closed), stopping reader thread.")
+                    app.logger.warning("PTY read error (FD likely closed), stopping reader thread.")
                     pty_running = False
                     break
                 except Exception as e:
-                    print(f"Error in PTY reader: {e}")
+                    app.logger.error(f"Error in PTY reader: {e}", exc_info=True)
                     pty_running = False
                     break
     finally:
-        print("PTY reader thread exited.")
+        app.logger.info("PTY reader thread exited.")
 
 # --- Flask HTTP Endpoints ---
 @app.route('/keystroke', methods=['POST'])
