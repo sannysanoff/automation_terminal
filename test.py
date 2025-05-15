@@ -136,11 +136,21 @@ def push_keystroke_sync():
                 return jsonify({"status": "success", "message": "Shell process exited during command execution."})
 
             try:
+                sfd_isatty = os.isatty(slave_fd)
+                sfd_name = "N/A"
+                if sfd_isatty:
+                    try:
+                        sfd_name = os.ttyname(slave_fd)
+                    except OSError as e_ttyname:
+                        sfd_name = f"Error getting ttyname: {e_ttyname}"
+                app.logger.debug(f"Diagnostics for slave_fd ({slave_fd}): isatty={sfd_isatty}, name='{sfd_name}'")
+
                 current_foreground_pgid = os.tcgetpgrp(slave_fd)
                 app.logger.debug(f"Polling PTY's foreground PGID: {current_foreground_pgid}. Shell's PGID: {shell_pgid}.")
             except OSError as e:
                 # This can happen if slave_fd is no longer valid (e.g., PTY closed, shell exited abruptly)
-                app.logger.error(f"Error calling tcgetpgrp on slave_fd ({slave_fd}): {e}. Assuming command finished or error.")
+                # or if tcgetpgrp is not permitted (e.g., ENOTTY on macOS for non-controlling TTYs)
+                app.logger.error(f"Error calling tcgetpgrp on slave_fd ({slave_fd}): {e} (errno: {e.errno}). Assuming command finished or error.")
                 if proc.poll() is not None: # Check again if shell exited
                      return jsonify({"status": "success", "message": "Shell process exited, PTY state uncertain."})
                 return jsonify({"status": "error", "message": f"Error checking PTY foreground process group: {e}"}), 500
