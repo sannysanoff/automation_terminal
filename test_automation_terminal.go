@@ -342,13 +342,13 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get captured lines *before* sending the command
-	// These are now managed by the eventHandler
+	// Reset and get fresh state before sending command
+	eventHandler.ResetCapturedLinesAndSetBuffer("")
 	linesBeforeCommandEffect, currentBufferBefore := eventHandler.GetCapturedLinesAndCurrentBuffer()
 	logDebug("SYNC: lines_before_command_effect (len %d): %v", len(linesBeforeCommandEffect), linesBeforeCommandEffect)
 	logDebug("SYNC: currentBufferBefore: '%s'", currentBufferBefore)
 
-
+	// Write command to PTY
 	_, err := ptyMaster.WriteString(keys)
 	if err != nil {
 		logError("Error writing to PTY for sync: %v", err)
@@ -522,56 +522,29 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 	logDebug("SYNC: lines_after_command_effect (len %d): %v", len(linesAfterCommandEffect), linesAfterCommandEffect)
 	logDebug("SYNC: final_current_line: '%s'", finalCurrentLine)
 
-	// Construct the output segment
-	// This logic needs to be robust. If linesBeforeCommandEffect was ["prompt>"] and currentBufferBefore was "prompt>",
-	// and after command, linesAfter is ["prompt>cmd", "output", "newprompt>"], finalCurrentLine is "newprompt>"
-	// The desired output is often ["cmd", "output", "newprompt>"]
-	// A simple slice diff might include the initial prompt line.
+	// Construct complete output including:
+	// 1. The prompt line before command
+	// 2. The command echo (if any)
+	// 3. The command output
+	// 4. The new prompt
 	
-	// Python version: output_segment = lines_after_command_effect[len(lines_before_command_effect):]
-	// This assumes lines_before_command_effect is a prefix of lines_after_command_effect.
+	// Start with empty output
+	outputSegment := make([]string, 0)
 	
-	startIdx := len(linesBeforeCommandEffect)
-	if len(linesBeforeCommandEffect) > 0 && startIdx <= len(linesAfterCommandEffect) {
-		// If the line where the command was typed is present in linesBeforeCommandEffect,
-		// and it's the same as the corresponding line in linesAfterCommandEffect (before command echo),
-		// then we might want to adjust.
-		// Example: linesBefore = ["A"], currentBufferBefore = "A" (prompt is "A")
-		// keys = "cmd\n"
-		// linesAfter = ["Acmd", "out"], finalCurrentLine = "B" (new prompt "B")
-		// outputSegment from linesAfter[1:] = ["out"]
-		// then append finalCurrentLine = "B" -> ["out", "B"]
-		// What we want is ["cmd", "out", "B"]
-		// This is tricky. The Python version's LoggingStream directly incorporates typed keys.
-		// Our eventHandler.Print sees the *echo* of keys.
-
-		// A simpler approach for now, similar to Python's slice, and adjust if needed:
-		if startIdx > len(linesAfterCommandEffect) { // Should not happen if logic is correct
-			startIdx = len(linesAfterCommandEffect)
-		}
-		outputSegment = linesAfterCommandEffect[startIdx:]
-		
-		// If currentBufferBefore (the prompt) was part of the first line of output,
-		// and the command was echoed on that line.
-		if len(linesBeforeCommandEffect) > 0 && startIdx > 0 && startIdx <= len(linesAfterCommandEffect) {
-			// This is the line where the command was typed: linesAfterCommandEffect[startIdx-1]
-			// It might contain the prompt + command echo.
-			// linesBeforeCommandEffect[startIdx-1] was the prompt line.
-			// This needs more sophisticated diffing if exact Python behavior is required.
-			// For now, let's assume the Python slice behavior is a good first step.
-		}
-
-	} else {
-		outputSegment = make([]string, len(linesAfterCommandEffect))
-		copy(outputSegment, linesAfterCommandEffect)
+	// If we had a current buffer (prompt) before sending command, include it
+	if currentBufferBefore != "" {
+		outputSegment = append(outputSegment, currentBufferBefore)
 	}
-
-
-	if finalCurrentLine != "" { // Add the last incomplete line (new prompt, or partial output)
+	
+	// Include all new lines captured after sending command
+	outputSegment = append(outputSegment, linesAfterCommandEffect...)
+	
+	// Include the final current line (new prompt or partial output)
+	if finalCurrentLine != "" {
 		outputSegment = append(outputSegment, finalCurrentLine)
 	}
 	
-	// Reset log for the next command
+	// Reset capture for next command, keeping only the new prompt
 	eventHandler.ResetCapturedLinesAndSetBuffer(finalCurrentLine)
 	logDebug("SYNC: Reset eventHandler captured lines. New buffer: '%s'", finalCurrentLine)
 
