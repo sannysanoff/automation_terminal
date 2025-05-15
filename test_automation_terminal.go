@@ -489,20 +489,43 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 		// Find child PIDs of the shell (not the shell itself)
 		var childPIDs []int
 		if runtime.GOOS == "darwin" {
-			// Use 'pgrep -P <shellPID>' to get direct children
-			pgrepCmd := exec.Command("pgrep", "-P", fmt.Sprintf("%d", shellPID))
-			out, err := pgrepCmd.Output()
+			// Use 'ps -a -o pid,ppid' to get all processes, then recursively find all descendants of shellPID
+			psCmd := exec.Command("ps", "-a", "-o", "pid,ppid")
+			out, err := psCmd.Output()
 			if err == nil {
+				type proc struct{ pid, ppid int }
+				var procs []proc
 				lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-				for _, line := range lines {
-					line = strings.TrimSpace(line)
-					if line == "" {
+				for _, line := range lines[1:] { // skip header
+					fields := strings.Fields(line)
+					if len(fields) != 2 {
 						continue
 					}
-					if pid, err := strconv.Atoi(line); err == nil && pid != shellPID {
-						childPIDs = append(childPIDs, pid)
+					pid, err1 := strconv.Atoi(fields[0])
+					ppid, err2 := strconv.Atoi(fields[1])
+					if err1 == nil && err2 == nil {
+						procs = append(procs, proc{pid, ppid})
 					}
 				}
+				// Build map: ppid -> []pid
+				childrenMap := make(map[int][]int)
+				for _, p := range procs {
+					childrenMap[p.ppid] = append(childrenMap[p.ppid], p.pid)
+				}
+				// Recursively collect all descendants of shellPID
+				var collect func(int)
+				seen := make(map[int]bool)
+				collect = func(ppid int) {
+					for _, pid := range childrenMap[ppid] {
+						if pid == shellPID || seen[pid] {
+							continue
+						}
+						seen[pid] = true
+						childPIDs = append(childPIDs, pid)
+						collect(pid)
+					}
+				}
+				collect(shellPID)
 			}
 		} else if runtime.GOOS == "linux" {
 			// Use 'ps -o pid= --ppid <shellPID>'
@@ -534,19 +557,40 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 			// Re-check for children
 			var stillChildren []int
 			if runtime.GOOS == "darwin" {
-				pgrepCmd := exec.Command("pgrep", "-P", fmt.Sprintf("%d", shellPID))
-				out, err := pgrepCmd.Output()
+				psCmd := exec.Command("ps", "-a", "-o", "pid,ppid")
+				out, err := psCmd.Output()
 				if err == nil {
+					type proc struct{ pid, ppid int }
+					var procs []proc
 					lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-					for _, line := range lines {
-						line = strings.TrimSpace(line)
-						if line == "" {
+					for _, line := range lines[1:] { // skip header
+						fields := strings.Fields(line)
+						if len(fields) != 2 {
 							continue
 						}
-						if pid, err := strconv.Atoi(line); err == nil && pid != shellPID {
-							stillChildren = append(stillChildren, pid)
+						pid, err1 := strconv.Atoi(fields[0])
+						ppid, err2 := strconv.Atoi(fields[1])
+						if err1 == nil && err2 == nil {
+							procs = append(procs, proc{pid, ppid})
 						}
 					}
+					childrenMap := make(map[int][]int)
+					for _, p := range procs {
+						childrenMap[p.ppid] = append(childrenMap[p.ppid], p.pid)
+					}
+					seen := make(map[int]bool)
+					var collect func(int)
+					collect = func(ppid int) {
+						for _, pid := range childrenMap[ppid] {
+							if pid == shellPID || seen[pid] {
+								continue
+							}
+							seen[pid] = true
+							stillChildren = append(stillChildren, pid)
+							collect(pid)
+						}
+					}
+					collect(shellPID)
 				}
 			} else if runtime.GOOS == "linux" {
 				psCmd := exec.Command("ps", "-o", "pid=", "--ppid", fmt.Sprintf("%d", shellPID))
@@ -574,19 +618,40 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 		// After waiting, check again and send SIGKILL if needed
 		var stillChildren []int
 		if runtime.GOOS == "darwin" {
-			pgrepCmd := exec.Command("pgrep", "-P", fmt.Sprintf("%d", shellPID))
-			out, err := pgrepCmd.Output()
+			psCmd := exec.Command("ps", "-a", "-o", "pid,ppid")
+			out, err := psCmd.Output()
 			if err == nil {
+				type proc struct{ pid, ppid int }
+				var procs []proc
 				lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-				for _, line := range lines {
-					line = strings.TrimSpace(line)
-					if line == "" {
+				for _, line := range lines[1:] { // skip header
+					fields := strings.Fields(line)
+					if len(fields) != 2 {
 						continue
 					}
-					if pid, err := strconv.Atoi(line); err == nil && pid != shellPID {
-						stillChildren = append(stillChildren, pid)
+					pid, err1 := strconv.Atoi(fields[0])
+					ppid, err2 := strconv.Atoi(fields[1])
+					if err1 == nil && err2 == nil {
+						procs = append(procs, proc{pid, ppid})
 					}
 				}
+				childrenMap := make(map[int][]int)
+				for _, p := range procs {
+					childrenMap[p.ppid] = append(childrenMap[p.ppid], p.pid)
+				}
+				seen := make(map[int]bool)
+				var collect func(int)
+				collect = func(ppid int) {
+					for _, pid := range childrenMap[ppid] {
+						if pid == shellPID || seen[pid] {
+							continue
+						}
+						seen[pid] = true
+						stillChildren = append(stillChildren, pid)
+						collect(pid)
+					}
+				}
+				collect(shellPID)
 			}
 		} else if runtime.GOOS == "linux" {
 			psCmd := exec.Command("ps", "-o", "pid=", "--ppid", fmt.Sprintf("%d", shellPID))
