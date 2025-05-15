@@ -9,6 +9,7 @@ import threading
 import signal
 import sys
 import time # Added for sleep
+import platform # For OS detection
 
 # --- Global variables ---
 # PTY and subprocess related
@@ -36,16 +37,29 @@ def count_processes_in_pgroup(pgid):
         app.logger.error(f"Invalid PGID for counting: {pgid}")
         return -1 # Indicate an error
 
-    command = ["ps", "-o", "pid", "--no-headers", "--pgid", str(pgid)]
+    system_os = platform.system()
+    if system_os == "Linux":
+        command = ["ps", "-o", "pid", "--no-headers", "--pgid", str(pgid)]
+    elif system_os == "Darwin": # macOS
+        # On macOS, `ps -g <pgid>` lists processes in the group.
+        # `-o pid=` prints only the PID without a header.
+        command = ["ps", "-o", "pid=", "-g", str(pgid)]
+    else:
+        app.logger.error(f"Unsupported OS for process counting: {system_os}")
+        return -1 # Indicate an error for unsupported OS
+
     try:
+        app.logger.debug(f"Executing process count command: '{" ".join(command)}'")
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         
         if result.returncode != 0:
-            # If ps returns non-zero, it could be that the PGID no longer exists.
-            # In this case, 0 processes is the correct count.
-            # stderr might contain "Specified process group NNNN does not exist."
-            if "does not exist" in result.stderr or "no such process" in result.stderr.lower():
-                app.logger.info(f"Process group {pgid} does not exist, assuming 0 processes.")
+            # If ps returns non-zero, it could be that the PGID no longer exists (common).
+            # Or, for macOS, if the group is empty, `ps -g` might return 1.
+            # We check stderr for specific messages indicating the group doesn't exist or is empty.
+            stderr_lower = result.stderr.lower()
+            if "does not exist" in stderr_lower or "no such process" in stderr_lower or \
+               (system_os == "Darwin" and result.stdout.strip() == "" and result.returncode == 1): # macOS specific for empty group
+                app.logger.info(f"Process group {pgid} appears empty or non-existent. Assuming 0 processes. stderr: {result.stderr.strip()}")
                 return 0
             else:
                 app.logger.warning(f"Command '{" ".join(command)}' failed with rc {result.returncode}, stderr: {result.stderr.strip()}")
