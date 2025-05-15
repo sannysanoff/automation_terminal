@@ -488,11 +488,17 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 				}
 				logWarn("pstree command for PID %d failed: %v. Output: %s. Assuming command still running or error with pstree.", shellPID, pstreeErr, string(pstreeOut))
 			}
-		} else { // Linux and other Unix-like systems
-			logDebug("Using tcgetpgrp on slave FD %d for non-macOS platform (Shell PGID: %d).", ptySlaveForTcgetpgrp.Fd(), shellPGID)
+		} else if runtime.GOOS == "linux" { // Linux specific
+			logDebug("Using tcgetpgrp on slave FD %d for Linux platform (Shell PGID: %d).", ptySlaveForTcgetpgrp.Fd(), shellPGID)
 			currentForegroundPGID, err := unix.Tcgetpgrp(int(ptySlaveForTcgetpgrp.Fd()))
 			if err != nil {
-				logError("Error calling tcgetpgrp on slave_fd (%d): %v (errno: %v). Assuming command finished or error.", ptySlaveForTcgetpgrp.Fd(), err, err.(syscall.Errno))
+				var errno syscall.Errno
+				if errors.As(err, &errno) {
+					logError("Error calling tcgetpgrp on slave_fd (%d): %v (errno: %d). Assuming command finished or error.", ptySlaveForTcgetpgrp.Fd(), err, errno)
+				} else {
+					logError("Error calling tcgetpgrp on slave_fd (%d): %v. Assuming command finished or error.", ptySlaveForTcgetpgrp.Fd(), err)
+				}
+
 				if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
 					completionMessage = "Shell process exited, PTY state uncertain after tcgetpgrp error."
 					commandCompletedNormally = true
@@ -509,6 +515,11 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 				commandCompletedNormally = true
 				break
 			}
+		} else { // Other Unix-like systems or unsupported
+			logWarn("Synchronous keystroke completion check is not implemented for this platform: %s. Assuming command completed.", runtime.GOOS)
+			completionMessage = fmt.Sprintf("Command completion check not available for %s.", runtime.GOOS)
+			commandCompletedNormally = true // Default to success to avoid blocking
+			break
 		}
 		time.Sleep(500 * time.Millisecond) // Polling interval
 	}
