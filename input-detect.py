@@ -33,19 +33,38 @@ def thread_waits(pid: int, verbose: bool = False) -> bool:
     if verbose:
         print(f"  Output for PID {pid}:\n{out.strip()}")
 
-    for line in out.splitlines()[1:]:
-        state, wchan = (line.strip().split(maxsplit=1) + [''])[:2]
+    for line in out.splitlines()[1:]: # Skip header line
+        parts = line.strip().split()
+        if not parts: # Handle empty lines if any
+            if verbose:
+                print(f"    Skipping empty line: '{line.strip()}'")
+            continue
+
+        # On some systems (like macOS observed by user), `ps -o state,wchan`
+        # might still print many columns, with the requested ones at the end.
+        # We assume 'wchan' is the very last column.
+        # 'state' would be second to last, but it's not used by WAIT_RE.
+        # Example wide line: "user  pid   ... command S -" (state='S', wchan='-')
+        # Example narrow line (often on Linux or direct ps -o state,wchan): "S    ttread" (state='S', wchan='ttread')
+        
+        wchan = parts[-1]
+            
         if verbose:
-            print(f"    Checking line: state='{state}', wchan='{wchan}'")
+            # For clarity in logs, show what's being interpreted as state and wchan
+            parsed_state_for_log = parts[-2] if len(parts) >= 2 else "N/A"
+            print(f"    Checking line (raw): '{line.strip()}'")
+            # print(f"    Parsed parts: {parts}") # Can be very verbose
+            print(f"    Interpreted state='{parsed_state_for_log}', wchan='{wchan}'")
+            
         match = WAIT_RE.match(wchan)
         if match:
             if verbose:
-                print(f"      Found matching wchan: '{wchan}'")
+                print(f"      Found matching wchan: '{wchan}' for PID {pid}")
             return True
         elif verbose:
-            print(f"      No match for wchan: '{wchan}'")
+            print(f"      No match for wchan: '{wchan}' (PID {pid})")
     if verbose:
-        print(f"  No waiting threads found for PID {pid}")
+        print(f"  No waiting threads found for PID {pid} (based on wchan values like {WAIT_RE.pattern})")
     return False
 
 def annotate(proc: psutil.Process, indent: str = '', verbose: bool = False) -> None:
