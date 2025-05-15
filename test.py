@@ -51,6 +51,23 @@ class LineCaptureListener: # No longer inherits from pyte.Stream
         # Removed diagnostic prints as they are not relevant for a simple listener.
         pass
 
+    # Add stub methods required by pyte.Stream.attach()
+    # These methods are not used by LineCaptureListener for its primary purpose (line capture)
+    # but must exist to satisfy the pyte.Stream listener interface.
+    def resize(self, lines=None, cols=None): pass
+    def set_charset(self, G0_charset, G1_charset, G2_charset, G3_charset): pass # Corrected signature based on typical use
+    def set_mode(self, *modes, **kwargs): pass # Allow private modes too
+    def reset_mode(self, *modes, **kwargs): pass # Allow private modes too
+    def set_margins(self, top=None, bottom=None): pass
+    def save_cursor(self): pass
+    def restore_cursor(self): pass
+    # draw is also a common method for screen listeners, though not in the explicit listener_events set.
+    # Adding it for completeness in case other parts of pyte might expect it.
+    # If it's not strictly needed by attach(), it doesn't harm.
+    # However, the error was specific to `restore_cursor` from `listener_events`.
+    # Let's stick to the ones explicitly checked by `listener_events` for now.
+    # The `dispatch` method handles events like "TEXT", "ESC", "CSI", etc.
+
     def dispatch(self, event: str, *args, **kwargs) -> None: # pyte listener interface
         # Raw print to stderr to confirm entry, bypassing Flask logger for this specific check.
         # Log event and args for better diagnostics.
