@@ -51,6 +51,11 @@ class LoggingStream(pyte.Stream):
         print(f"DIAGNOSTIC: LoggingStream MRO: {LoggingStream.mro()}", file=sys.stderr, flush=True)
         print(f"DIAGNOSTIC: pyte.Stream has 'dispatch' attribute? {'dispatch' in dir(pyte.Stream)}", file=sys.stderr, flush=True)
         print(f"DIAGNOSTIC: type(pyte.Stream.dispatch) is {type(pyte.Stream.dispatch) if 'dispatch' in dir(pyte.Stream) else 'N/A'}", file=sys.stderr, flush=True)
+        # Diagnostic print for parser's stream reference
+        if hasattr(self, 'parser') and hasattr(self.parser, 'stream'):
+            print(f"DIAGNOSTIC: LoggingStream id(self): {id(self)}, id(self.parser.stream): {id(self.parser.stream)}, self.parser: {self.parser}", file=sys.stderr, flush=True)
+        else:
+            print(f"DIAGNOSTIC: LoggingStream self.parser or self.parser.stream not found during init.", file=sys.stderr, flush=True)
 
 
     def dispatch(self, event: str, *args, **kwargs) -> None: # Signature changed
@@ -143,16 +148,17 @@ def pty_reader_thread_function():
                         app.logger.debug(f"PTY Read {len(decoded_data)} chars: '{log_snippet}...'")
                         if stream:
                             app.logger.debug(f"PTY Reader: About to call stream.feed(). stream object type: {type(stream)}, stream object: {stream}")
-                            if decoded_data: # Ensure there's at least one character for the direct call test
-                                first_char_for_direct_test = decoded_data[0]
-                                # Corrected diagnostic call to use ("TEXT", char)
-                                app.logger.debug(f"PTY Reader: Attempting DIRECT call to stream.dispatch() with event='TEXT', char='{first_char_for_direct_test.encode('unicode_escape').decode()}'")
-                                try:
-                                    stream.dispatch("TEXT", first_char_for_direct_test) # Corrected direct call for diagnostics
-                                except Exception as e_direct_dispatch:
-                                    app.logger.error(f"PTY Reader: EXCEPTION during DIRECT call to stream.dispatch('TEXT', char): {e_direct_dispatch}", exc_info=True)
+                            # REMOVED Direct diagnostic call to stream.dispatch()
+                            # The following block was for diagnostics and is now removed:
+                            # if decoded_data:
+                            #     first_char_for_direct_test = decoded_data[0]
+                            #     app.logger.debug(f"PTY Reader: Attempting DIRECT call to stream.dispatch() with event='TEXT', char='{first_char_for_direct_test.encode('unicode_escape').decode()}'")
+                            #     try:
+                            #         stream.dispatch("TEXT", first_char_for_direct_test)
+                            #     except Exception as e_direct_dispatch:
+                            #         app.logger.error(f"PTY Reader: EXCEPTION during DIRECT call to stream.dispatch('TEXT', char): {e_direct_dispatch}", exc_info=True)
                             
-                            app.logger.debug(f"PTY Reader: Now calling original stream.feed() with all {len(decoded_data)} chars.")
+                            app.logger.debug(f"PTY Reader: Now calling stream.feed() with all {len(decoded_data)} chars.")
                             stream.feed(decoded_data)
                         else:
                             app.logger.warning("PTY Reader: stream object is None. Cannot feed data.")
