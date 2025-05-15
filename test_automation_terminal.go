@@ -61,6 +61,7 @@ type KeystrokeSyncResponse struct {
 	Message string `json:"message"`
 	Output  string `json:"output,omitempty"`
 	Error   string `json:"error,omitempty"`
+	Timeout bool   `json:"timeout,omitempty"`
 }
 
 type ScreenResponse struct {
@@ -397,13 +398,18 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(KeystrokeSyncResponse{Status: "error", Message: fmt.Sprintf("Failed to get shell PGID: %v", err)})
 		return
 	}
-	logInfo("Waiting for command completion. Shell PID: %d, Shell PGID: %d. Max wait: %ds.", shellPID, shellPGID, maxSyncWaitSeconds)
+	// --- Timeout/kill logic additions ---
+	const syncTimeoutSeconds = 30
+	const sigintWaitSeconds = 5
+	timeoutHappened := false
+
+	logInfo("Waiting for command completion. Shell PID: %d, Shell PGID: %d. Max wait: %ds.", shellPID, shellPGID, syncTimeoutSeconds)
 
 	startTime := time.Now()
 	commandCompletedNormally := false
 	completionMessage := "Command completion status unknown."
 
-	for time.Since(startTime).Seconds() < float64(maxSyncWaitSeconds) {
+	for time.Since(startTime).Seconds() < float64(syncTimeoutSeconds) {
 		if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
 			logInfo("Shell process (PID: %d) exited during wait.", shellPID)
 			completionMessage = "Shell process exited during command execution."
@@ -418,10 +424,6 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 			logDebug("pstree for PID %d: Output:\n%s", shellPID, string(pstreeOut))
 
 			if pstreeErr == nil {
-				// Assumption: 1 line of output (the process itself) means no children.
-				// pstree might add a header or the output format might vary.
-				// A more robust check might be needed, e.g. count lines with "---" or specific process names.
-				// For now, simple line count, excluding empty lines.
 				lines := strings.Split(strings.TrimSpace(string(pstreeOut)), "\n")
 				actualLines := 0
 				for _, line := range lines {
@@ -436,7 +438,6 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 			} else {
-				// pstree failed. If shell exited, that's the reason.
 				if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
 					logInfo("Shell process (PID: %d) exited (detected after pstree failure).", shellPID)
 					completionMessage = "Shell process exited (detected after pstree failure)."
@@ -445,17 +446,13 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 				}
 				logWarn("pstree command for PID %d failed: %v. Output: %s. Assuming command still running or error with pstree.", shellPID, pstreeErr, string(pstreeOut))
 			}
-		} else if runtime.GOOS == "linux" { // Linux specific: check for child processes
+		} else if runtime.GOOS == "linux" {
 			logDebug("Using ps/awk to check for children of shell PID %d on Linux.", shellPID)
-			// Command: ps -o pid,ppid,comm -ax | awk '$2 == <shellPID> {print $1}'
-			// We need to run this as a shell pipeline or construct it carefully with Go's exec.
-			// Using sh -c for simplicity here.
 			psCmd := fmt.Sprintf("ps -o pid,ppid,comm -ax | awk '$2 == %d {print $1}'", shellPID)
 			cmd := exec.Command("sh", "-c", psCmd)
 
 			output, err := cmd.Output()
 			if err != nil {
-				// If the command fails (e.g. awk not found, or ps error), check if shell exited.
 				if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
 					logInfo("Shell process (PID: %d) exited (detected after ps/awk command failure).", shellPID)
 					completionMessage = "Shell process exited (detected after ps/awk command failure)."
@@ -463,30 +460,105 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				logWarn("ps/awk command for PID %d failed: %v. Output: %s. Assuming command still running or error with command.", shellPID, err, string(output))
-				// Unlike tcgetpgrp error which might indicate a PTY issue, this is more likely a tool issue.
-				// We could let it timeout, or return an error. For now, let it continue and potentially timeout.
-				// If critical, an error response could be sent:
-				// w.WriteHeader(http.StatusInternalServerError)
-				// json.NewEncoder(w).Encode(KeystrokeSyncResponse{Status: "error", Message: fmt.Sprintf("Error checking child processes: %v", err)})
-				// return
 			} else {
 				trimmedOutput := strings.TrimSpace(string(output))
 				logDebug("ps/awk output for children of PID %d: '%s'", shellPID, trimmedOutput)
-				if trimmedOutput == "" { // No child PIDs printed
+				if trimmedOutput == "" {
 					logInfo("Linux ps/awk check: Shell PID %d has no children. Command complete.", shellPID)
 					completionMessage = "Command completed (Linux ps/awk check)."
 					commandCompletedNormally = true
 					break
 				}
-				// If there's output, children exist, command is still running.
 			}
-		} else { // Other Unix-like systems or unsupported
+		} else {
 			logWarn("Synchronous keystroke completion check is not implemented for this platform: %s. Assuming command completed.", runtime.GOOS)
 			completionMessage = fmt.Sprintf("Command completion check not available for %s.", runtime.GOOS)
-			commandCompletedNormally = true // Default to success to avoid blocking
+			commandCompletedNormally = true
 			break
 		}
-		time.Sleep(500 * time.Millisecond) // Polling interval
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// If not completed, send SIGINT, wait, then SIGKILL if needed
+	if !commandCompletedNormally {
+		timeoutHappened = true
+		logWarn("Timeout waiting for command completion (Shell PGID: %d did not become foreground or children did not exit).", shellPGID)
+		completionMessage = fmt.Sprintf("Command did not complete within %d seconds.", syncTimeoutSeconds)
+
+		// Send SIGINT to the process group
+		logWarn("Sending SIGINT to process group %d...", shellPGID)
+		_ = unix.Kill(-shellPGID, syscall.SIGINT)
+
+		// Wait up to sigintWaitSeconds for children to exit
+		sigintStart := time.Now()
+		for time.Since(sigintStart).Seconds() < float64(sigintWaitSeconds) {
+			// Check if all children (except shell) are gone
+			childrenGone := false
+			if runtime.GOOS == "darwin" {
+				pstreeCmd := exec.Command("pstree", fmt.Sprintf("%d", shellPID))
+				pstreeOut, pstreeErr := pstreeCmd.CombinedOutput()
+				if pstreeErr == nil {
+					lines := strings.Split(strings.TrimSpace(string(pstreeOut)), "\n")
+					actualLines := 0
+					for _, line := range lines {
+						if strings.TrimSpace(line) != "" {
+							actualLines++
+						}
+					}
+					if actualLines == 1 {
+						childrenGone = true
+					}
+				}
+			} else if runtime.GOOS == "linux" {
+				psCmd := fmt.Sprintf("ps -o pid,ppid,comm -ax | awk '$2 == %d {print $1}'", shellPID)
+				cmd := exec.Command("sh", "-c", psCmd)
+				output, err := cmd.Output()
+				if err == nil {
+					trimmedOutput := strings.TrimSpace(string(output))
+					if trimmedOutput == "" {
+						childrenGone = true
+					}
+				}
+			}
+			if childrenGone {
+				logInfo("All child processes (except shell) exited after SIGINT.")
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		// After waiting, check again
+		childrenStillExist := false
+		if runtime.GOOS == "darwin" {
+			pstreeCmd := exec.Command("pstree", fmt.Sprintf("%d", shellPID))
+			pstreeOut, pstreeErr := pstreeCmd.CombinedOutput()
+			if pstreeErr == nil {
+				lines := strings.Split(strings.TrimSpace(string(pstreeOut)), "\n")
+				actualLines := 0
+				for _, line := range lines {
+					if strings.TrimSpace(line) != "" {
+						actualLines++
+					}
+				}
+				if actualLines > 1 {
+					childrenStillExist = true
+				}
+			}
+		} else if runtime.GOOS == "linux" {
+			psCmd := fmt.Sprintf("ps -o pid,ppid,comm -ax | awk '$2 == %d {print $1}'", shellPID)
+			cmd := exec.Command("sh", "-c", psCmd)
+			output, err := cmd.Output()
+			if err == nil {
+				trimmedOutput := strings.TrimSpace(string(output))
+				if trimmedOutput != "" {
+					childrenStillExist = true
+				}
+			}
+		}
+		if childrenStillExist {
+			logWarn("Child processes still exist after SIGINT, sending SIGKILL to process group %d...", shellPGID)
+			_ = unix.Kill(-shellPGID, syscall.SIGKILL)
+		}
 	}
 
 	time.Sleep(200 * time.Millisecond) // Short final delay for output processing
@@ -494,13 +566,14 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 	status := "success"
 	httpStatusCode := http.StatusOK
 
-	if !commandCompletedNormally {
-		if shellCmd.ProcessState == nil || !shellCmd.ProcessState.Exited() { // Timeout
-			logWarn("Timeout waiting for command completion (Shell PGID: %d did not become foreground or children did not exit).", shellPGID)
-			completionMessage = fmt.Sprintf("Command did not complete within %d seconds.", maxSyncWaitSeconds)
+	if timeoutHappened {
+		status = "timeout"
+		httpStatusCode = http.StatusServiceUnavailable
+	} else if !commandCompletedNormally {
+		if shellCmd.ProcessState == nil || !shellCmd.ProcessState.Exited() {
 			status = "timeout"
 			httpStatusCode = http.StatusServiceUnavailable
-		} else { // Shell exited during loop but not caught as completion (should be rare)
+		} else {
 			logInfo("Shell process (PID: %d) exited during wait (final check).", shellPID)
 			completionMessage = "Shell process exited during command execution (final check)."
 		}
@@ -510,18 +583,16 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 	logDebug("SYNC: lines_after_command_effect (len %d): %v", len(linesAfterCommandEffect), linesAfterCommandEffect)
 	logDebug("SYNC: final_current_line: '%s'", finalCurrentLine)
 
-	// Build one string: echo+output + next prompt
 	joined := strings.Join(linesAfterCommandEffect, "")
 	if finalCurrentLine != "" {
 		joined += finalCurrentLine
 	}
-	// Reset capture for next command (keep only the new prompt)
 	eventHandler.ResetCapturedLinesAndSetBuffer(finalCurrentLine)
 	logDebug("SYNC: Returning joined output: %q", joined)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(httpStatusCode)
 	json.NewEncoder(w).Encode(
-		KeystrokeSyncResponse{Status: status, Message: completionMessage, Output: joined},
+		KeystrokeSyncResponse{Status: status, Message: completionMessage, Output: joined, Timeout: timeoutHappened},
 	)
 }
 
