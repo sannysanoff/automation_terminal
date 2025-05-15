@@ -407,12 +407,26 @@ def main():
         app.logger.info("  POST /keystroke_sync (form data: {'keys': 'your_command\\n'})")
         app.logger.info("  GET  /screen")
         
+        # Attempt to set the host TTY to a sane state before Flask runs,
+        # if we are connected to a TTY. This can help if terminal settings
+        # were inadvertently changed.
+        if sys.stdin.isatty():
+            app.logger.info("Attempting to set host TTY to 'sane' mode.")
+            try:
+                subprocess.run(["stty", "sane"], check=True)
+            except FileNotFoundError:
+                app.logger.warning("'stty' command not found. Cannot set TTY to sane mode.")
+            except subprocess.CalledProcessError as e:
+                app.logger.warning(f"Failed to set TTY to sane mode: {e}")
+            except Exception as e:
+                app.logger.warning(f"An unexpected error occurred while trying to run 'stty sane': {e}")
+
         # Run Flask web server.
         # use_reloader=False is critical when managing subprocesses and threads.
         # debug=True enables Flask's debugger and more verbose logging.
         app.run(host='127.0.0.1', port=5399, debug=True, use_reloader=False)
 
-    except KeyboardInterrupt: # This might not be reached if sigint_handler exits directly
+    except KeyboardInterrupt: 
         app.logger.info("KeyboardInterrupt caught in main. Shutting down...")
     except Exception as e:
         app.logger.error(f"An unexpected error occurred in main: {e}", exc_info=True)
