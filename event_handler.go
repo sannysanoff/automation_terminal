@@ -184,16 +184,12 @@ func (h *TermEventHandler) Print(b byte) error {
 
 	// Line capture logic for /keystroke_sync
 	if char == '\n' {
-		h.capturedLinesForSync = append(h.capturedLinesForSync, h.lineBufferForCapture.String())
+		// Always append current buffer and include the newline in output
+		h.capturedLinesForSync = append(h.capturedLinesForSync, h.lineBufferForCapture.String()+"\n")
 		logDebug("EventHandler LineCapture LF: Appending CBL ('%s') to PLL. New PLL len: %d. Clearing CBL.", h.lineBufferForCapture.String(), len(h.capturedLinesForSync))
 		h.lineBufferForCapture.Reset()
 	} else if char == '\r' {
-		// CR alone doesn't typically end a line in raw capture for some shells,
-		// but for consistency with existing logic, let's keep it.
-		// If the line buffer is not empty, it means CR is terminating it.
-		// If it's part of CRLF, the LF will handle the append.
-		// This might lead to empty lines if CR is solitary and buffer is empty.
-		// The original Python code appended on CR.
+		// For CR, append current buffer (without CR) and clear
 		h.capturedLinesForSync = append(h.capturedLinesForSync, h.lineBufferForCapture.String())
 		logDebug("EventHandler LineCapture CR: Appending CBL ('%s') to PLL. New PLL len: %d. Clearing CBL.", h.lineBufferForCapture.String(), len(h.capturedLinesForSync))
 		h.lineBufferForCapture.Reset()
