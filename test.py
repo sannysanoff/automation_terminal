@@ -180,6 +180,7 @@ def push_keystroke_sync():
             # current_line_buffer_for_listener holds the prompt the user is about to type on,
             # or an empty string if the prompt ended with \n or \r.
             # This initial current line will be merged with the typed keys by LoggingStream.
+            app.logger.debug(f"SYNC: lines_before_command_effect: {lines_before_command_effect}")
         
         os.write(master_fd, keys.encode('utf-8'))
         app.logger.info(f"Sent keys for sync: '{keys.strip()}'")
@@ -315,6 +316,8 @@ def push_keystroke_sync():
         with pyte_listener_lock:
             lines_after_command_effect = list(pyte_listener_lines)
             final_current_line = current_line_buffer_for_listener
+            app.logger.debug(f"SYNC: lines_after_command_effect: {lines_after_command_effect}")
+            app.logger.debug(f"SYNC: final_current_line: '{final_current_line}'")
             
             # Construct the output segment from the point the command started affecting the log
             output_segment = lines_after_command_effect[len(lines_before_command_effect):]
@@ -327,6 +330,7 @@ def push_keystroke_sync():
             current_line_buffer_for_listener = final_current_line
             pyte_listener_lines = []
         
+        app.logger.debug(f"SYNC: Returning output_segment: {output_segment}")
         return jsonify({"status": result_status, "message": completion_message, "output": output_segment}), status_code
 
     except ProcessLookupError: # os.getpgid(proc.pid) can fail if proc died just before the call
