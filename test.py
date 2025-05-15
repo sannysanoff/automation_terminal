@@ -49,6 +49,7 @@ class LoggingStream(pyte.Stream):
         # Uses global pyte_listener_lines, current_line_buffer_for_listener, and pyte_listener_lock
 
     def dispatch(self, char: str) -> None:
+        global current_line_buffer_for_listener, pyte_listener_lines, pyte_listener_lock, verbose_logging_enabled
         # Log entry into dispatch, and the character being processed (escaped for readability)
         # This log is NOT conditional on verbose_logging_enabled to ensure we see if dispatch is called.
         # We also log the perceived state of verbose_logging_enabled from within this method.
@@ -59,7 +60,6 @@ class LoggingStream(pyte.Stream):
         super().dispatch(char)
 
         # Now, log the character for our separate line buffer
-        global current_line_buffer_for_listener, pyte_listener_lines, pyte_listener_lock, verbose_logging_enabled
         with pyte_listener_lock:
             if char == "\n":
                 if verbose_logging_enabled:
