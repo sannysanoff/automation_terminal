@@ -19,42 +19,35 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unicode"
-
+	"github.com/Azure/go-ansiterm"
 	"github.com/creack/pty"
-	"github.com/xyproto/vt100"
 	"golang.org/x/sys/unix"
+	// "unicode" // Moved to event_handler.go if still needed there for IsPrint
 )
 
 // --- Global variables ---
 var (
 	// PTY and subprocess related
-	ptyMaster             *os.File
-	ptySlaveForTcgetpgrp  *os.File // Parent's handle to the slave PTY, primarily for tcgetpgrp
-	shellCmd              *exec.Cmd
-	vtScreen              *vt100.Canvas
-	currentScreenCursorMu sync.Mutex
-	currentScreenX        uint
-	currentScreenY        uint
+	ptyMaster            *os.File
+	ptySlaveForTcgetpgrp *os.File // Parent's handle to the slave PTY, primarily for tcgetpgrp
+	shellCmd             *exec.Cmd
+	ansiParser           *ansiterm.AnsiParser
+	eventHandler         *TermEventHandler // Our custom ANSI event handler
 
 	// Control flag for the PTY reader goroutine
 	ptyRunning    bool
 	ptyRunningMu  sync.Mutex
 	ptyReaderDone chan struct{} // To signal PTY reader completion
 
-	// For capturing terminal output lines
-	// Stores complete lines captured from the PTY stream
-	capturedLines               []string
-	currentLineBuffer           bytes.Buffer
-	capturedLinesMu             sync.Mutex
-	verboseLoggingEnabled       bool
-	maxSyncWaitSeconds    int = 60 // Maximum wait time for synchronous keystroke command completion
-	defaultPtyCols        uint = 80
-	defaultPtyLines       uint = 25 // Changed from 24 to 25
+	// For capturing terminal output lines (now managed by eventHandler)
+	// capturedLines               []string // Replaced by eventHandler.capturedLinesForSync
+	// currentLineBuffer           bytes.Buffer // Replaced by eventHandler.lineBufferForCapture
+	// capturedLinesMu             sync.Mutex // Replaced by eventHandler.mu (or could be separate if needed)
 
-	// Default colors for plotting and clearing
-	defaultFg = vt100.Default
-	defaultBg = vt100.DefaultBackground
+	verboseLoggingEnabled    bool
+	maxSyncWaitSeconds int = 60 // Maximum wait time for synchronous keystroke command completion
+	defaultPtyCols     int = 80 // Changed to int for easier use with TermEventHandler
+	defaultPtyLines    int = 25 // Changed to int
 )
 
 // --- Structs for HTTP responses ---
@@ -114,7 +107,7 @@ func setupPtyAndShell() error {
 		}
 	}
 
-	envMap["TERM"] = "vt100"
+	envMap["TERM"] = "vt100" // go-ansiterm can parse vt100 sequences. "ansi" is also an option.
 	envMap["COLUMNS"] = fmt.Sprintf("%d", defaultPtyCols)
 	envMap["LINES"] = fmt.Sprintf("%d", defaultPtyLines)
 	envMap["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" // Basic PATH
@@ -165,8 +158,8 @@ func setupPtyAndShell() error {
 
 	// Set the PTY size
 	ws := &pty.Winsize{
-		Rows: uint16(defaultPtyLines),
-		Cols: uint16(defaultPtyCols),
+		Rows: uint16(defaultPtyLines), // defaultPtyLines is now int, cast to uint16
+		Cols: uint16(defaultPtyCols),  // defaultPtyCols is now int, cast to uint16
 	}
 	if err := pty.Setsize(ptyMaster, ws); err != nil {
 		ptyMaster.Close()
@@ -209,12 +202,13 @@ func setupPtyAndShell() error {
 
 	logInfo("Shell process (%s) started with PID: %d, PGID: %d", shellPath, shellCmd.Process.Pid, shellCmd.Process.Pid)
 
+	// Initialize TermEventHandler and AnsiParser
+	eventHandler = NewTermEventHandler(defaultPtyLines, defaultPtyCols)
+	// The initial state for the parser is "Ground" according to go-ansiterm examples.
+	ansiParser = ansiterm.CreateParser("Ground", eventHandler)
+	// If verbose logging for ansiterm parser itself is desired:
+	// ansiParser = ansiterm.CreateParser("Ground", eventHandler, ansiterm.WithLogf(logDebug))
 
-	vtScreen = vt100.NewCanvas()
-	// Canvas size is determined by vt100.NewCanvas() via MustTermSize().
-	// COLUMNS and LINES env vars are set, which MustTermSize may use as a fallback.
-	vtScreen.Clear() // Clear with default colors
-	vtScreen.SetRunewise(false) // Use faster block drawing if possible
 
 	ptyRunningMu.Lock()
 	ptyRunning = true
@@ -228,7 +222,8 @@ func setupPtyAndShell() error {
 func ptyReader() {
 	defer close(ptyReaderDone)
 	logInfo("PTY reader goroutine started.")
-	reader := bufio.NewReader(ptyMaster)
+	// Buffer for reading from PTY master
+	buf := make([]byte, 4096)
 
 	for {
 		ptyRunningMu.Lock()
@@ -239,23 +234,25 @@ func ptyReader() {
 		ptyRunningMu.Unlock()
 
 		// Set a deadline for reading to make the loop check ptyRunning periodically
-		// This is a simple way, select on a channel would be more robust for immediate shutdown
+		// This also prevents Read from blocking indefinitely if ptyRunning is set to false.
+		if ptyMaster == nil { // ptyMaster might be closed by cleanup
+			logWarn("ptyMaster is nil in ptyReader loop, exiting.")
+			break
+		}
 		ptyMaster.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		
-		r, size, err := reader.ReadRune()
+
+		n, err := ptyMaster.Read(buf)
 		if err != nil {
-			if os.IsTimeout(err) { // ptyMaster.SetReadDeadline caused this
-				continue
+			if os.IsTimeout(err) { // Deadline exceeded
+				continue // Loop back to check ptyRunning
 			}
+			// Handle other errors
 			if err == io.EOF {
 				logInfo("PTY EOF (shell exited), stopping reader goroutine.")
+			} else if strings.Contains(err.Error(), "input/output error") || strings.Contains(err.Error(), "file already closed") {
+				logWarn("PTY read error (FD likely closed by cleanup), stopping reader goroutine.")
 			} else {
-				// Check if the error is "read /dev/ptmx: input/output error" which means PTY closed
-				if strings.Contains(err.Error(), "input/output error") || strings.Contains(err.Error(), "file already closed") {
-					logWarn("PTY read error (FD likely closed by cleanup), stopping reader goroutine.")
-				} else {
-					logError("Error reading from PTY: %v", err)
-				}
+				logError("Error reading from PTY: %v", err)
 			}
 			ptyRunningMu.Lock()
 			ptyRunning = false // Signal to stop
@@ -263,96 +260,20 @@ func ptyReader() {
 			break
 		}
 
-		if size > 0 {
-			char := r
-			logDebug("PTY Read char: '%s' (rune: %U)", string(char), char)
+		if n > 0 {
+			data := buf[:n]
+			logDebug("PTY Read %d bytes: %q", n, string(data)) // Log raw bytes or a snippet
 
-			// Update captured lines (for /keystroke_sync) - This logic remains the same
-			capturedLinesMu.Lock()
-			if char == '\n' {
-				capturedLines = append(capturedLines, currentLineBuffer.String())
-				logDebug("LineCapture LF: Appending CBL ('%s') to PLL. Old PLL len: %d. New PLL len: %d. Clearing CBL.", currentLineBuffer.String(), len(capturedLines)-1, len(capturedLines))
-				currentLineBuffer.Reset()
-			} else if char == '\r' {
-				capturedLines = append(capturedLines, currentLineBuffer.String())
-				logDebug("LineCapture CR: Appending CBL ('%s') to PLL. Old PLL len: %d. New PLL len: %d. Clearing CBL.", currentLineBuffer.String(), len(capturedLines)-1, len(capturedLines))
-				currentLineBuffer.Reset()
-			} else if char == '\b' { // Backspace
-				if currentLineBuffer.Len() > 0 {
-					oldCBL := currentLineBuffer.String()
-					if currentLineBuffer.Len() > 0 {
-						currentLineBuffer.Truncate(currentLineBuffer.Len() - 1)
-					}
-					logDebug("LineCapture BS: CBL was '%s', now '%s'", oldCBL, currentLineBuffer.String())
+			// Feed data to the AnsiParser
+			// The eventHandler (TermEventHandler) will update the screen model
+			// and also handle the line capture logic internally via its Print method.
+			if ansiParser != nil {
+				_, parseErr := ansiParser.Parse(data)
+				if parseErr != nil {
+					logError("Error parsing ANSI stream: %v", parseErr)
+					// Depending on severity, might want to stop or continue
 				}
-			} else if unicode.IsPrint(char) {
-				currentLineBuffer.WriteRune(char)
-				logDebug("LineCapture CHAR: Adding char '%s' to CBL. CBL now: '%s'", string(char), currentLineBuffer.String())
 			}
-			capturedLinesMu.Unlock()
-
-			// Update vtScreen (for /screen endpoint) - Enhanced manual plotting with scrolling and clearing
-			currentScreenCursorMu.Lock()
-			if vtScreen != nil {
-				// Helper: Clears a line in the viewport from xStart to end
-				clearLineInViewport := func(y uint, xStart uint) {
-					if y >= defaultPtyLines {
-						return
-					}
-					for x := xStart; x < defaultPtyCols; x++ {
-						vtScreen.WriteRuneB(x, y, defaultFg, defaultBg, ' ')
-					}
-				}
-
-				// Helper: Scrolls the viewport content up by one line
-				scrollViewportUp := func() {
-					for y := uint(0); y < defaultPtyLines-1; y++ {
-						for x := uint(0); x < defaultPtyCols; x++ {
-							r, _ := vtScreen.At(x, y+1) // Reads rune, loses color
-							vtScreen.WriteRuneB(x, y, defaultFg, defaultBg, r)
-						}
-					}
-					clearLineInViewport(defaultPtyLines-1, 0) // Clear the new last line
-				}
-
-				if char == '\n' {
-					currentScreenX = 0
-					if currentScreenY < defaultPtyLines-1 {
-						currentScreenY++
-						clearLineInViewport(currentScreenY, currentScreenX) // Clear new line from cursor
-					} else { // On the last line, scroll
-						scrollViewportUp()
-						// currentScreenY remains defaultPtyLines-1
-						// currentScreenX is 0 (already set), new last line is cleared by scrollViewportUp
-					}
-				} else if char == '\r' {
-					currentScreenX = 0
-					// CR does not inherently clear the line in simple terminal models
-				} else if char == '\b' { // Backspace
-					if currentScreenX > 0 {
-						currentScreenX--
-						// Erase character at new cursor position by writing a space with default colors
-						vtScreen.WriteRuneB(currentScreenX, currentScreenY, defaultFg, defaultBg, ' ')
-					}
-				} else if unicode.IsPrint(char) { // Printable character
-					if currentScreenX >= defaultPtyCols { // Line wrap
-						currentScreenX = 0 // Move to start of next line
-						if currentScreenY < defaultPtyLines-1 {
-							currentScreenY++
-							clearLineInViewport(currentScreenY, currentScreenX) // Clear new line
-						} else { // Wrap on the last line, scroll
-							scrollViewportUp()
-							// currentScreenY remains defaultPtyLines-1
-							// currentScreenX is 0, new line is cleared
-						}
-					}
-					// Plot the character using defined default foreground and background
-					vtScreen.WriteRuneB(currentScreenX, currentScreenY, defaultFg, defaultBg, char)
-					currentScreenX++ // Advance cursor
-				}
-				// Non-printable, non-control characters (like null) are skipped for screen plotting
-			}
-			currentScreenCursorMu.Unlock()
 		}
 	}
 	logInfo("PTY reader goroutine exited.")
@@ -423,15 +344,12 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var linesBeforeCommandEffect []string
-	capturedLinesMu.Lock()
-	linesBeforeCommandEffect = make([]string, len(capturedLines))
-	copy(linesBeforeCommandEffect, capturedLines)
-	// The currentLineBuffer in Python is merged by LoggingStream. Here, it's simpler:
-	// the content of currentLineBuffer is partial output of the *previous* command or the prompt.
-	// The keys sent will form new content.
+	// Get captured lines *before* sending the command
+	// These are now managed by the eventHandler
+	linesBeforeCommandEffect, currentBufferBefore := eventHandler.GetCapturedLinesAndCurrentBuffer()
 	logDebug("SYNC: lines_before_command_effect (len %d): %v", len(linesBeforeCommandEffect), linesBeforeCommandEffect)
-	capturedLinesMu.Unlock()
+	logDebug("SYNC: currentBufferBefore: '%s'", currentBufferBefore)
+
 
 	_, err := ptyMaster.WriteString(keys)
 	if err != nil {
@@ -446,21 +364,38 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 
 	if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
 		logInfo("Shell process exited shortly after command submission and initial sleep.")
-		capturedLinesMu.Lock()
-		linesAfter := make([]string, len(capturedLines))
-		copy(linesAfter, capturedLines)
-		finalCurrentLine := currentLineBuffer.String()
+		
+		linesAfter, finalCurrentLine := eventHandler.GetCapturedLinesAndCurrentBuffer()
 		
 		outputSegment := linesAfter[len(linesBeforeCommandEffect):]
-		if finalCurrentLine != "" { // Add incomplete line
+		// The finalCurrentLine from eventHandler *is* the current line being built.
+		// If the command produced partial output without a newline, it's in finalCurrentLine.
+		// If the command produced full lines and a new prompt, finalCurrentLine is the new prompt.
+		// We need to decide if the currentBufferBefore (old prompt) should be part of output.
+		// The Python version's logic implies the input keys merge with the current line.
+		// Our eventHandler.Print appends to its internal line buffer.
+		// The `keys` sent are processed by the shell, echoed, and then parsed by eventHandler.
+		// So, `linesBeforeCommandEffect` is up to the prompt. `linesAfter` includes echo + output.
+		// `finalCurrentLine` is the new prompt or unterminated output.
+
+		// If currentBufferBefore was the prompt, and keys were "cmd\n"
+		// linesBefore: ["prompt>"] currentBufferBefore: "prompt>" (if no \n after prompt)
+		// or linesBefore: ["line1", "prompt>"] currentBufferBefore: "prompt>"
+		// After keys: linesAfter might be ["prompt>cmd", "output1", "newprompt>"], finalCurrentLine: "newprompt>"
+		// Output segment should be ["cmd", "output1", "newprompt>"] (if prompt was part of first line)
+		// This needs careful alignment with how pyte_listener_lines are constructed.
+		// For now, a simpler diff:
+		if len(linesBeforeCommandEffect) > 0 && len(linesAfter) > 0 && strings.HasPrefix(linesAfter[len(linesBeforeCommandEffect)-1], linesBeforeCommandEffect[len(linesBeforeCommandEffect)-1]) {
+			// This attempts to handle the case where the command is echoed on the same line as the prompt
+			// For now, let's use the simpler logic as in the main path.
+		}
+
+		if finalCurrentLine != "" {
 			outputSegment = append(outputSegment, finalCurrentLine)
 		}
-		// Reset log for next command
-		currentLineBuffer.Reset() // The new prompt might be in finalCurrentLine
-		currentLineBuffer.WriteString(finalCurrentLine) // Or it might be empty
-		capturedLines = capturedLines[:0] // Clear captured lines, effectively
-		logDebug("SYNC (shell exited path): Reset CBL to '%s', PLL to empty.", currentLineBuffer.String())
-		capturedLinesMu.Unlock()
+		
+		eventHandler.ResetCapturedLinesAndSetBuffer(finalCurrentLine)
+		logDebug("SYNC (shell exited path): Reset eventHandler captured lines. New buffer: '%s'", finalCurrentLine)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(KeystrokeSyncResponse{Status: "success", Message: "Shell process exited shortly after command submission.", Output: outputSegment})
@@ -585,24 +520,62 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	
-	capturedLinesMu.Lock()
-	linesAfterCommandEffect := make([]string, len(capturedLines))
-	copy(linesAfterCommandEffect, capturedLines)
-	finalCurrentLine := currentLineBuffer.String()
+	linesAfterCommandEffect, finalCurrentLine := eventHandler.GetCapturedLinesAndCurrentBuffer()
 	logDebug("SYNC: lines_after_command_effect (len %d): %v", len(linesAfterCommandEffect), linesAfterCommandEffect)
 	logDebug("SYNC: final_current_line: '%s'", finalCurrentLine)
 
-	outputSegment = linesAfterCommandEffect[len(linesBeforeCommandEffect):]
+	// Construct the output segment
+	// This logic needs to be robust. If linesBeforeCommandEffect was ["prompt>"] and currentBufferBefore was "prompt>",
+	// and after command, linesAfter is ["prompt>cmd", "output", "newprompt>"], finalCurrentLine is "newprompt>"
+	// The desired output is often ["cmd", "output", "newprompt>"]
+	// A simple slice diff might include the initial prompt line.
+	
+	// Python version: output_segment = lines_after_command_effect[len(lines_before_command_effect):]
+	// This assumes lines_before_command_effect is a prefix of lines_after_command_effect.
+	
+	startIdx := len(linesBeforeCommandEffect)
+	if len(linesBeforeCommandEffect) > 0 && startIdx <= len(linesAfterCommandEffect) {
+		// If the line where the command was typed is present in linesBeforeCommandEffect,
+		// and it's the same as the corresponding line in linesAfterCommandEffect (before command echo),
+		// then we might want to adjust.
+		// Example: linesBefore = ["A"], currentBufferBefore = "A" (prompt is "A")
+		// keys = "cmd\n"
+		// linesAfter = ["Acmd", "out"], finalCurrentLine = "B" (new prompt "B")
+		// outputSegment from linesAfter[1:] = ["out"]
+		// then append finalCurrentLine = "B" -> ["out", "B"]
+		// What we want is ["cmd", "out", "B"]
+		// This is tricky. The Python version's LoggingStream directly incorporates typed keys.
+		// Our eventHandler.Print sees the *echo* of keys.
+
+		// A simpler approach for now, similar to Python's slice, and adjust if needed:
+		if startIdx > len(linesAfterCommandEffect) { // Should not happen if logic is correct
+			startIdx = len(linesAfterCommandEffect)
+		}
+		outputSegment = linesAfterCommandEffect[startIdx:]
+		
+		// If currentBufferBefore (the prompt) was part of the first line of output,
+		// and the command was echoed on that line.
+		if len(linesBeforeCommandEffect) > 0 && startIdx > 0 && startIdx <= len(linesAfterCommandEffect) {
+			// This is the line where the command was typed: linesAfterCommandEffect[startIdx-1]
+			// It might contain the prompt + command echo.
+			// linesBeforeCommandEffect[startIdx-1] was the prompt line.
+			// This needs more sophisticated diffing if exact Python behavior is required.
+			// For now, let's assume the Python slice behavior is a good first step.
+		}
+
+	} else {
+		outputSegment = make([]string, len(linesAfterCommandEffect))
+		copy(outputSegment, linesAfterCommandEffect)
+	}
+
+
 	if finalCurrentLine != "" { // Add the last incomplete line (new prompt, or partial output)
 		outputSegment = append(outputSegment, finalCurrentLine)
 	}
 	
 	// Reset log for the next command
-	currentLineBuffer.Reset()
-	currentLineBuffer.WriteString(finalCurrentLine) // The new prompt is now the current buffer
-	capturedLines = capturedLines[:0] // Clear all captured lines
-	logDebug("SYNC: Reset CBL to '%s', PLL to empty.", currentLineBuffer.String())
-	capturedLinesMu.Unlock()
+	eventHandler.ResetCapturedLinesAndSetBuffer(finalCurrentLine)
+	logDebug("SYNC: Reset eventHandler captured lines. New buffer: '%s'", finalCurrentLine)
 
 	logDebug("SYNC: Returning output_segment (len %d): %v", len(outputSegment), outputSegment)
 	w.Header().Set("Content-Type", "application/json")
@@ -616,51 +589,21 @@ func screenHandler(w http.ResponseWriter, r *http.Request) {
 	active := ptyRunning
 	ptyRunningMu.Unlock()
 
-	if vtScreen == nil || !active {
-		logWarn("Screen/PTY not active for /screen")
+	if eventHandler == nil || !active {
+		logWarn("Screen/PTY not active for /screen (eventHandler nil or PTY not running)")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		json.NewEncoder(w).Encode(ScreenResponse{Error: "Screen not active or not initialized"})
 		return
 	}
 
-	currentScreenCursorMu.Lock()
-	// vtScreen.String() returns the characters. We might want to format it like pyte's display (list of strings).
-	// vtScreen.Display() is not a method. We need to iterate over vtScreen.Chars2() or similar.
-	// For simplicity, let's use vtScreen.String() and split by newline.
-	// However, vtScreen.String() adds newlines. We want the raw grid.
-	
-	var displayData []string
-	// vtScreen.Lock() // vt100.Canvas has its own mutex. Our currentScreenCursorMu protects currentScreenX/Y.
-	// Loop over the configured PTY dimensions (defaultPtyLines x defaultPtyCols).
-	for y := uint(0); y < defaultPtyLines; y++ {
-		var lineBuilder strings.Builder
-		for x := uint(0); x < defaultPtyCols; x++ {
-			// Ensure we don't try to read beyond vtScreen's actual dimensions,
-			// though vtScreen is expected to be larger or equal.
-			if y < vtScreen.Height() && x < vtScreen.Width() {
-				char, _ := vtScreen.At(x, y) // At returns rune, error
-				if char == rune(0) {         // rune(0) is a null rune, treat as space
-					lineBuilder.WriteRune(' ')
-				} else {
-					lineBuilder.WriteRune(char)
-				}
-			} else {
-				// This case implies defaultPty dimensions are larger than vtScreen's actual size.
-				// This shouldn't happen given the problem description (vtScreen is larger).
-				// Fill with space if it occurs.
-				lineBuilder.WriteRune(' ')
-			}
-		}
-		displayData = append(displayData, lineBuilder.String())
-	}
-	// vtScreen.Unlock()
+	displayData := eventHandler.GetScreenContent()
+	cursorX, cursorY, cursorHidden := eventHandler.GetCursorState()
 
 	cursorData := ScreenCursorState{
-		X:      currentScreenX, // This is our virtual cursor position, already 80x25 constrained
-		Y:      currentScreenY,
-		Hidden: false, // vt100.Canvas doesn't explicitly track its own cursor visibility for ShowCursor(false)
+		X:      uint(cursorX), // Convert int to uint for struct
+		Y:      uint(cursorY),
+		Hidden: cursorHidden,
 	}
-	currentScreenCursorMu.Unlock()
 	
 	logDebug("Screen data (first 3 lines): %v, Cursor: %+v", displayData[:min(3, len(displayData))], cursorData)
 	w.Header().Set("Content-Type", "application/json")
