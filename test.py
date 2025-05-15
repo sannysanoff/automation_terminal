@@ -272,6 +272,11 @@ def push_keystroke_sync():
             time.sleep(0.5) # Polling interval
         
         # After loop: either completed, timed out, or shell exited.
+        # Add a very short sleep here to allow any final PTY output (e.g., final prompt)
+        # to be processed by the pty_reader_thread and LoggingStream before we capture the output.
+        # This is especially important if command completion was detected very quickly.
+        time.sleep(0.2) # Short final delay for output processing
+
         if not command_completed_normally and proc.poll() is None: # Timeout
             app.logger.warning(f"Timeout waiting for command completion (Shell PGID: {shell_pgid} did not become foreground).")
             completion_message = f"Command did not complete within {MAX_SYNC_WAIT_SECONDS} seconds."
