@@ -297,37 +297,36 @@ func ptyReader() {
 			if vtScreen != nil {
 				if char == '\n' {
 					currentScreenX = 0
-					if currentScreenY < vtScreen.Height()-1 {
+					if currentScreenY < defaultPtyLines-1 {
 						currentScreenY++
 					} else {
-						// At the bottom line, effectively overwriting or Plot will ignore if y is out of bounds.
-						// No direct scroll method available in vt100.Canvas to shift content up.
-						logDebug("Screen at bottom, new line will overwrite last line or be ignored by Plot if Y exceeds canvas height.")
+						// At the bottom line of our virtual 80x25 screen.
+						logDebug("Screen at bottom (defaultPtyLines), new line would effectively scroll or overwrite.")
 					}
 				} else if char == '\r' {
 					currentScreenX = 0
 				} else if char == '\b' {
 					if currentScreenX > 0 {
 						currentScreenX--
-						// Plot a space to erase the character. Ensure Y is within bounds.
-						if currentScreenY < vtScreen.Height() {
-							vtScreen.Plot(currentScreenX, currentScreenY, ' ') 
-						}
+						// Plot a space to erase the character. currentScreenY is within defaultPtyLines.
+						// vtScreen.Plot handles bounds check against its own (larger) dimensions.
+						vtScreen.Plot(currentScreenX, currentScreenY, ' ')
 					}
 				} else if unicode.IsPrint(char) { // Check if the character is printable
-					if currentScreenX >= vtScreen.Width() { // Line wrap
+					if currentScreenX >= defaultPtyCols { // Line wrap based on defaultPtyCols
 						currentScreenX = 0
-						if currentScreenY < vtScreen.Height()-1 {
+						if currentScreenY < defaultPtyLines-1 {
 							currentScreenY++
 						} else {
-							logDebug("Screen at bottom-right, new char on new line will overwrite last line or be ignored.")
+							logDebug("Screen at bottom-right (defaultPtyLines/Cols), new char on new line would effectively scroll or overwrite.")
 						}
 					}
-					// Ensure X and Y are within bounds for PlotColor
-					if currentScreenX < vtScreen.Width() && currentScreenY < vtScreen.Height() {
+					// Plot if current virtual cursor is within the 80x25 virtual screen.
+					// vtScreen.PlotColor handles actual bounds check against its own (larger) dimensions.
+					if currentScreenX < defaultPtyCols && currentScreenY < defaultPtyLines {
 						vtScreen.PlotColor(currentScreenX, currentScreenY, vt100.Default, char)
 					}
-					currentScreenX++
+					currentScreenX++ // Increment virtual cursor X
 				}
 			}
 			currentScreenCursorMu.Unlock()
@@ -608,22 +607,25 @@ func screenHandler(w http.ResponseWriter, r *http.Request) {
 	// However, vtScreen.String() adds newlines. We want the raw grid.
 	
 	var displayData []string
-	// vtScreen.Lock() // vt100.Canvas has its own mutex, but we are also managing cursor separately
-	for y := uint(0); y < vtScreen.Height(); y++ {
+	// vtScreen.Lock() // vt100.Canvas has its own mutex. Our currentScreenCursorMu protects currentScreenX/Y.
+	// Loop over the configured PTY dimensions (defaultPtyLines x defaultPtyCols).
+	for y := uint(0); y < defaultPtyLines; y++ {
 		var lineBuilder strings.Builder
-		for x := uint(0); x < vtScreen.Width(); x++ {
-			// vtScreen.At(x,y) returns rune, error. We need the ColorRune
-			// Directly access internal chars array if possible, or use a method that gives char at pos.
-			// vtScreen.Get(x,y) is not available. Let's assume direct access or a helper.
-			// The `chars` field is lowercase, so not exported.
-			// Let's use `vtScreen.Rune(x,y)` if available, or build from `String()`
-			// `vtScreen.Cell(x,y)` might be better. Let's check `canvas.go`.
-			// `vtScreen.Rune(uint(x), uint(y))` seems to be the way.
-			char, _ := vtScreen.At(x,y) // At returns rune, error
-			if char == rune(0) {
-				lineBuilder.WriteRune(' ')
+		for x := uint(0); x < defaultPtyCols; x++ {
+			// Ensure we don't try to read beyond vtScreen's actual dimensions,
+			// though vtScreen is expected to be larger or equal.
+			if y < vtScreen.Height() && x < vtScreen.Width() {
+				char, _ := vtScreen.At(x, y) // At returns rune, error
+				if char == rune(0) {         // rune(0) is a null rune, treat as space
+					lineBuilder.WriteRune(' ')
+				} else {
+					lineBuilder.WriteRune(char)
+				}
 			} else {
-				lineBuilder.WriteRune(char)
+				// This case implies defaultPty dimensions are larger than vtScreen's actual size.
+				// This shouldn't happen given the problem description (vtScreen is larger).
+				// Fill with space if it occurs.
+				lineBuilder.WriteRune(' ')
 			}
 		}
 		displayData = append(displayData, lineBuilder.String())
@@ -631,9 +633,9 @@ func screenHandler(w http.ResponseWriter, r *http.Request) {
 	// vtScreen.Unlock()
 
 	cursorData := ScreenCursorState{
-		X:      currentScreenX,
+		X:      currentScreenX, // This is our virtual cursor position, already 80x25 constrained
 		Y:      currentScreenY,
-		Hidden: false, // vt100.Canvas doesn't explicitly track cursor visibility in a simple way
+		Hidden: false, // vt100.Canvas doesn't explicitly track its own cursor visibility for ShowCursor(false)
 	}
 	currentScreenCursorMu.Unlock()
 	
