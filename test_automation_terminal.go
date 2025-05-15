@@ -17,6 +17,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"strconv"
 
 	"github.com/Azure/go-ansiterm"
 	"github.com/creack/pty"
@@ -479,85 +480,135 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// If not completed, send SIGINT, wait, then SIGKILL if needed
+	// If not completed, send SIGINT/SIGKILL only to non-shell children, not the shell itself
 	if !commandCompletedNormally {
 		timeoutHappened = true
 		logWarn("Timeout waiting for command completion (Shell PGID: %d did not become foreground or children did not exit).", shellPGID)
 		completionMessage = fmt.Sprintf("Command did not complete within %d seconds.", syncTimeoutSeconds)
 
-		// Send SIGINT to the process group
-		logWarn("Sending SIGINT to process group %d...", shellPGID)
-		_ = unix.Kill(-shellPGID, syscall.SIGINT)
+		// Find child PIDs of the shell (not the shell itself)
+		var childPIDs []int
+		if runtime.GOOS == "darwin" {
+			// Use 'pgrep -P <shellPID>' to get direct children
+			pgrepCmd := exec.Command("pgrep", "-P", fmt.Sprintf("%d", shellPID))
+			out, err := pgrepCmd.Output()
+			if err == nil {
+				lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+				for _, line := range lines {
+					line = strings.TrimSpace(line)
+					if line == "" {
+						continue
+					}
+					if pid, err := strconv.Atoi(line); err == nil && pid != shellPID {
+						childPIDs = append(childPIDs, pid)
+					}
+				}
+			}
+		} else if runtime.GOOS == "linux" {
+			// Use 'ps -o pid= --ppid <shellPID>'
+			psCmd := exec.Command("ps", "-o", "pid=", "--ppid", fmt.Sprintf("%d", shellPID))
+			out, err := psCmd.Output()
+			if err == nil {
+				lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+				for _, line := range lines {
+					line = strings.TrimSpace(line)
+					if line == "" {
+						continue
+					}
+					if pid, err := strconv.Atoi(line); err == nil && pid != shellPID {
+						childPIDs = append(childPIDs, pid)
+					}
+				}
+			}
+		}
+
+		// Send SIGINT to each child process (not the shell)
+		for _, pid := range childPIDs {
+			logWarn("Sending SIGINT to child process %d...", pid)
+			_ = unix.Kill(pid, syscall.SIGINT)
+		}
 
 		// Wait up to sigintWaitSeconds for children to exit
 		sigintStart := time.Now()
 		for time.Since(sigintStart).Seconds() < float64(sigintWaitSeconds) {
-			// Check if all children (except shell) are gone
-			childrenGone := false
+			// Re-check for children
+			var stillChildren []int
 			if runtime.GOOS == "darwin" {
-				pstreeCmd := exec.Command("pstree", fmt.Sprintf("%d", shellPID))
-				pstreeOut, pstreeErr := pstreeCmd.CombinedOutput()
-				if pstreeErr == nil {
-					lines := strings.Split(strings.TrimSpace(string(pstreeOut)), "\n")
-					actualLines := 0
+				pgrepCmd := exec.Command("pgrep", "-P", fmt.Sprintf("%d", shellPID))
+				out, err := pgrepCmd.Output()
+				if err == nil {
+					lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 					for _, line := range lines {
-						if strings.TrimSpace(line) != "" {
-							actualLines++
+						line = strings.TrimSpace(line)
+						if line == "" {
+							continue
 						}
-					}
-					if actualLines == 1 {
-						childrenGone = true
+						if pid, err := strconv.Atoi(line); err == nil && pid != shellPID {
+							stillChildren = append(stillChildren, pid)
+						}
 					}
 				}
 			} else if runtime.GOOS == "linux" {
-				psCmd := fmt.Sprintf("ps -o pid,ppid,comm -ax | awk '$2 == %d {print $1}'", shellPID)
-				cmd := exec.Command("sh", "-c", psCmd)
-				output, err := cmd.Output()
+				psCmd := exec.Command("ps", "-o", "pid=", "--ppid", fmt.Sprintf("%d", shellPID))
+				out, err := psCmd.Output()
 				if err == nil {
-					trimmedOutput := strings.TrimSpace(string(output))
-					if trimmedOutput == "" {
-						childrenGone = true
+					lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+					for _, line := range lines {
+						line = strings.TrimSpace(line)
+						if line == "" {
+							continue
+						}
+						if pid, err := strconv.Atoi(line); err == nil && pid != shellPID {
+							stillChildren = append(stillChildren, pid)
+						}
 					}
 				}
 			}
-			if childrenGone {
+			if len(stillChildren) == 0 {
 				logInfo("All child processes (except shell) exited after SIGINT.")
 				break
 			}
 			time.Sleep(500 * time.Millisecond)
 		}
 
-		// After waiting, check again
-		childrenStillExist := false
+		// After waiting, check again and send SIGKILL if needed
+		var stillChildren []int
 		if runtime.GOOS == "darwin" {
-			pstreeCmd := exec.Command("pstree", fmt.Sprintf("%d", shellPID))
-			pstreeOut, pstreeErr := pstreeCmd.CombinedOutput()
-			if pstreeErr == nil {
-				lines := strings.Split(strings.TrimSpace(string(pstreeOut)), "\n")
-				actualLines := 0
+			pgrepCmd := exec.Command("pgrep", "-P", fmt.Sprintf("%d", shellPID))
+			out, err := pgrepCmd.Output()
+			if err == nil {
+				lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 				for _, line := range lines {
-					if strings.TrimSpace(line) != "" {
-						actualLines++
+					line = strings.TrimSpace(line)
+					if line == "" {
+						continue
 					}
-				}
-				if actualLines > 1 {
-					childrenStillExist = true
+					if pid, err := strconv.Atoi(line); err == nil && pid != shellPID {
+						stillChildren = append(stillChildren, pid)
+					}
 				}
 			}
 		} else if runtime.GOOS == "linux" {
-			psCmd := fmt.Sprintf("ps -o pid,ppid,comm -ax | awk '$2 == %d {print $1}'", shellPID)
-			cmd := exec.Command("sh", "-c", psCmd)
-			output, err := cmd.Output()
+			psCmd := exec.Command("ps", "-o", "pid=", "--ppid", fmt.Sprintf("%d", shellPID))
+			out, err := psCmd.Output()
 			if err == nil {
-				trimmedOutput := strings.TrimSpace(string(output))
-				if trimmedOutput != "" {
-					childrenStillExist = true
+				lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+				for _, line := range lines {
+					line = strings.TrimSpace(line)
+					if line == "" {
+						continue
+					}
+					if pid, err := strconv.Atoi(line); err == nil && pid != shellPID {
+						stillChildren = append(stillChildren, pid)
+					}
 				}
 			}
 		}
-		if childrenStillExist {
-			logWarn("Child processes still exist after SIGINT, sending SIGKILL to process group %d...", shellPGID)
-			_ = unix.Kill(-shellPGID, syscall.SIGKILL)
+		if len(stillChildren) > 0 {
+			for _, pid := range stillChildren {
+				logWarn("Child process still exists after SIGINT, sending SIGKILL to %d...", pid)
+				_ = unix.Kill(pid, syscall.SIGKILL)
+			}
 		}
 	}
 
