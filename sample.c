@@ -11,10 +11,10 @@ int main() {
     int choice = rand() % 2;
     
     if (choice) {
-        printf("Will sleep for 3600 seconds\n");
+        printf("[PID %d] Will sleep for 3600 seconds\n", getpid());
         sleep(3600);
     } else {
-        printf("Will read from stdin\n");
+        printf("[PID %d] Will read from stdin\n", getpid());
         char buffer[256];
         fgets(buffer, sizeof(buffer), stdin);
     }
