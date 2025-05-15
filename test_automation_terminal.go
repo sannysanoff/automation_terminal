@@ -50,7 +50,7 @@ var (
 	verboseLoggingEnabled       bool
 	maxSyncWaitSeconds    int = 60 // Maximum wait time for synchronous keystroke command completion
 	defaultPtyCols        uint = 80
-	defaultPtyLines       uint = 24
+	defaultPtyLines       uint = 25 // Changed from 24 to 25
 )
 
 // --- Structs for HTTP responses ---
@@ -158,6 +158,18 @@ func setupPtyAndShell() error {
 	}
 	ptyMaster = ptmx
 	ptySlaveForTcgetpgrp = tty // Keep this for tcgetpgrp
+
+	// Set the PTY size
+	ws := &pty.Winsize{
+		Rows: uint16(defaultPtyLines),
+		Cols: uint16(defaultPtyCols),
+	}
+	if err := pty.Setsize(ptyMaster, ws); err != nil {
+		ptyMaster.Close()
+		ptySlaveForTcgetpgrp.Close()
+		return fmt.Errorf("failed to set PTY size: %w", err)
+	}
+	logInfo("PTY size set to %dx%d", defaultPtyCols, defaultPtyLines)
 
 	shellCmd = exec.Command(shellArgs[0], shellArgs[1:]...)
 	shellCmd.Env = finalEnv
