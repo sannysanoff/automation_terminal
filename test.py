@@ -257,7 +257,7 @@ def main():
         # This should be set up after PTY and process are initialized.
         signal.signal(signal.SIGINT, sigint_handler)
 
-        print(f"Flask server starting on http://127.0.0.1:5000")
+        print(f"Flask server starting on http://127.0.0.1:5399")
         print("Endpoints:")
         print("  POST /keystroke (form data: {'keys': 'your_command\\n'})")
         print("  GET  /screen")
@@ -265,7 +265,7 @@ def main():
         # Run Flask web server.
         # use_reloader=False is critical when managing subprocesses and threads.
         # debug=True enables Flask's debugger and more verbose logging.
-        app.run(host='127.0.0.1', port=5000, debug=True, use_reloader=False)
+        app.run(host='127.0.0.1', port=5399, debug=True, use_reloader=False)
 
     except KeyboardInterrupt:
         print("KeyboardInterrupt caught in main. Shutting down...")
