@@ -119,7 +119,10 @@ def pty_reader_thread_function():
                         # Using app.logger for consistency if Flask's logger is configured
                         app.logger.debug(f"PTY Read {len(decoded_data)} chars: '{log_snippet}...'")
                         if stream:
+                            app.logger.debug(f"PTY Reader: About to call stream.feed(). stream object type: {type(stream)}, stream object: {stream}")
                             stream.feed(decoded_data)
+                        else:
+                            app.logger.warning("PTY Reader: stream object is None. Cannot feed data.")
                     else:  # EOF: PTY has been closed (e.g., shell exited)
                         app.logger.info("PTY EOF (empty data read), stopping reader thread.")
                         pty_running = False # Signal to stop, if not already
