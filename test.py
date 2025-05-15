@@ -42,39 +42,30 @@ app = Flask(__name__)
 # Maximum wait time for synchronous keystroke command completion (in seconds)
 MAX_SYNC_WAIT_SECONDS = 60
 
-# --- Custom Pyte Stream for Logging ---
-class LoggingStream(pyte.Stream):
-    def __init__(self): # screen argument removed
-        super().__init__() # Correct call to superclass __init__
-        # Uses global pyte_listener_lines, current_line_buffer_for_listener, and pyte_listener_lock
-        # Diagnostic prints for MRO and superclass attributes
-        print(f"DIAGNOSTIC: LoggingStream MRO: {LoggingStream.mro()}", file=sys.stderr, flush=True)
-        print(f"DIAGNOSTIC: pyte.Stream has 'dispatch' attribute? {'dispatch' in dir(pyte.Stream)}", file=sys.stderr, flush=True)
-        print(f"DIAGNOSTIC: type(pyte.Stream.dispatch) is {type(pyte.Stream.dispatch) if 'dispatch' in dir(pyte.Stream) else 'N/A'}", file=sys.stderr, flush=True)
-        # Diagnostic print for parser's stream reference
-        if hasattr(self, 'parser') and hasattr(self.parser, 'stream'):
-            print(f"DIAGNOSTIC: LoggingStream id(self): {id(self)}, id(self.parser.stream): {id(self.parser.stream)}, self.parser: {self.parser}", file=sys.stderr, flush=True)
-        else:
-            print(f"DIAGNOSTIC: LoggingStream self.parser or self.parser.stream not found during init.", file=sys.stderr, flush=True)
+# --- Custom Listener for Line Capture ---
+class LineCaptureListener: # No longer inherits from pyte.Stream
+    def __init__(self):
+        # This listener uses global variables for line capture:
+        # pyte_listener_lines, current_line_buffer_for_listener, pyte_listener_lock
+        # No complex initialization needed here.
+        # Removed diagnostic prints as they are not relevant for a simple listener.
+        pass
 
-
-    def dispatch(self, event: str, *args, **kwargs) -> None: # Signature changed
+    def dispatch(self, event: str, *args, **kwargs) -> None: # pyte listener interface
         # Raw print to stderr to confirm entry, bypassing Flask logger for this specific check.
         # Log event and args for better diagnostics.
-        print(f"RAW_DISPATCH_ENTRY: event='{event}', args={args}, kwargs={kwargs}", file=sys.stderr, flush=True)
+        print(f"RAW_DISPATCH_ENTRY (LineCaptureListener): event='{event}', args={args}, kwargs={kwargs}", file=sys.stderr, flush=True)
         
         global current_line_buffer_for_listener, pyte_listener_lines, pyte_listener_lock, verbose_logging_enabled
         # Log entry into dispatch, using event and args.
-        app.logger.debug(f"LoggingStream.dispatch entered: event='{event}', args={args}, verbose_enabled_in_dispatch={verbose_logging_enabled}")
+        app.logger.debug(f"LineCaptureListener.dispatch entered: event='{event}', args={args}, verbose_enabled_in_dispatch={verbose_logging_enabled}")
 
-        # Let pyte.Stream.dispatch handle passing to all attached listeners (e.g., screen) first.
-        # This ensures screen.display and screen.cursor are up-to-date before our custom logic.
-        # --- TEMPORARILY COMMENTED OUT FOR DIAGNOSTICS ---
-        # super().dispatch(event, *args, **kwargs) # Corrected call to superclass dispatch
-        print(f"DIAGNOSTIC: super().dispatch was SKIPPED in LoggingStream.dispatch for event='{event}'", file=sys.stderr, flush=True)
+        # This listener is only interested in "TEXT" events for line capture.
+        # It does not call super().dispatch() as it's not part of a complex inheritance chain
+        # for dispatching, and it's not a pyte.Stream itself.
+        # The pyte.Stream that this listener is attached to will handle dispatching
+        # to other listeners (like pyte.Screen).
 
-
-        # Now, log the character for our separate line buffer, only if it's a "TEXT" event.
         if event == "TEXT":
             if not args: # Should not happen for TEXT event, but good to guard
                 app.logger.warning("LoggingStream: TEXT event received with no args.")
@@ -635,10 +626,14 @@ def main():
         # The parent's copy of slave_fd is not directly used for read/write by the parent,
         # but it needs to be kept open until the child is done, then closed by cleanup.
 
-        # Initialize pyte screen and our custom logging stream
+        # Initialize pyte screen, our custom line capture listener, and a standard pyte stream
         screen = pyte.Screen(cols, lines)
-        stream = LoggingStream()       # Instantiate LoggingStream without arguments
-        stream.attach(screen)          # Attach the screen as a listener to the stream
+        line_capturer = LineCaptureListener() # Instantiate our custom listener
+        stream = pyte.Stream()                # Instantiate a standard pyte.Stream
+
+        stream.attach(screen)        # Attach the screen to display terminal content
+        stream.attach(line_capturer) # Attach our listener to capture lines
+
         pty_running = True  # Set flag before starting thread
 
         # Start the PTY reader thread
