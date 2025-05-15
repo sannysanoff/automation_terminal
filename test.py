@@ -4,6 +4,7 @@ import pty
 import subprocess
 import select
 import pyte
+import unicodedata # Added for character category checking
 from flask import Flask, request, jsonify
 import threading
 import signal
@@ -22,11 +23,51 @@ pty_running = True
 # PTY reader thread object
 pty_thread = None
 
+# --- Globals for capturing terminal output lines ---
+# Stores complete lines captured from the PTY stream
+pyte_listener_lines = []
+# Accumulates characters for the current line being built by LoggingStream
+current_line_buffer_for_listener = ""
+# Lock to protect access to pyte_listener_lines and current_line_buffer_for_listener
+pyte_listener_lock = threading.Lock()
+
 # Flask application
 app = Flask(__name__)
 
 # Maximum wait time for synchronous keystroke command completion (in seconds)
 MAX_SYNC_WAIT_SECONDS = 60
+
+# --- Custom Pyte Stream for Logging ---
+class LoggingStream(pyte.Stream):
+    def __init__(self, screen):
+        super().__init__(screen)
+        # Uses global pyte_listener_lines, current_line_buffer_for_listener, and pyte_listener_lock
+
+    def dispatch(self, char: str) -> None:
+        # Let pyte.Stream handle the character first for screen updates
+        # This ensures screen.display and screen.cursor are up-to-date
+        super().dispatch(char)
+
+        # Now, log the character for our separate line buffer
+        global current_line_buffer_for_listener, pyte_listener_lines, pyte_listener_lock
+        with pyte_listener_lock:
+            if char == "\n":
+                pyte_listener_lines.append(current_line_buffer_for_listener)
+                current_line_buffer_for_listener = ""
+            elif char == "\r":
+                # Carriage return: current line is considered finished or will be overwritten.
+                # Log it if it has content, then clear buffer for subsequent characters.
+                if current_line_buffer_for_listener: # Log what was there before CR
+                    pyte_listener_lines.append(current_line_buffer_for_listener)
+                current_line_buffer_for_listener = "" 
+            elif char == "\x08":  # Backspace
+                if current_line_buffer_for_listener:
+                    current_line_buffer_for_listener = current_line_buffer_for_listener[:-1]
+            # Check if it's a printable char (not a control character)
+            elif not unicodedata.category(char).startswith('C'):
+                current_line_buffer_for_listener += char
+            # Else: it's a control character (like ESC, etc.) not explicitly handled for the log.
+            # It was still processed by super().dispatch() for pyte.Screen.
 
 # --- PTY Reader Thread ---
 def pty_reader_thread_function():
@@ -97,7 +138,7 @@ def push_keystroke_sync():
     Completion is defined as the shell process regaining foreground control of the PTY.
     Expects form data: {'keys': 'your_command\\n'}
     """
-    global master_fd, proc, slave_fd # slave_fd is needed for tcgetpgrp
+    global master_fd, proc, slave_fd, pyte_listener_lines, current_line_buffer_for_listener, pyte_listener_lock
     app.logger.info(f"Received POST /keystroke_sync. Form data: {request.form}")
 
     if not master_fd or not pty_running or slave_fd is None:
@@ -112,28 +153,55 @@ def push_keystroke_sync():
         keys = request.form.get('keys')
         if keys is None:
             return jsonify({"error": "Missing 'keys' in form data"}), 400
+
+        # Snapshot captured lines before sending keys and command execution
+        with pyte_listener_lock:
+            lines_before_command_effect = list(pyte_listener_lines)
+            # current_line_buffer_for_listener holds the prompt the user is about to type on,
+            # or an empty string if the prompt ended with \n or \r.
+            # This initial current line will be merged with the typed keys by LoggingStream.
         
         os.write(master_fd, keys.encode('utf-8'))
         app.logger.info(f"Sent keys for sync: '{keys.strip()}'")
 
-        # Initial sleep to allow the command to start
-        time.sleep(1.0)
+        # Initial sleep to allow the command to start and for its echo to be processed
+        time.sleep(1.0) 
 
         # Check if shell is still running after sending keys and initial sleep
         if proc.poll() is not None:
             app.logger.info("Shell process exited shortly after command submission and initial sleep.")
-            return jsonify({"status": "success", "message": "Shell process exited shortly after command submission."})
+            # Capture output even if shell exits quickly
+            with pyte_listener_lock:
+                lines_after_command_effect = list(pyte_listener_lines)
+                final_current_line = current_line_buffer_for_listener
+                
+                output_segment = lines_after_command_effect[len(lines_before_command_effect):]
+                if final_current_line: # Add the last incomplete line (new prompt, or partial output)
+                    output_segment.append(final_current_line)
+
+                # Reset log for next command
+                if final_current_line:
+                    pyte_listener_lines = [final_current_line]
+                    current_line_buffer_for_listener = ""
+                else:
+                    pyte_listener_lines = []
+                    current_line_buffer_for_listener = ""
+            return jsonify({"status": "success", "message": "Shell process exited shortly after command submission.", "output": output_segment})
 
         shell_pid = proc.pid
         shell_pgid = os.getpgid(shell_pid) # PGID of the shell process itself
         app.logger.info(f"Waiting for command completion. Shell PID: {shell_pid}, Shell PGID: {shell_pgid}. Max wait: {MAX_SYNC_WAIT_SECONDS}s.")
-        # Note: slave_fd related debug logging moved into platform-specific block
-
+        
         start_time = time.time()
+        command_completed_normally = False
+        completion_message = "Command completion status unknown."
+
         while time.time() - start_time < MAX_SYNC_WAIT_SECONDS:
             if proc.poll() is not None: # Shell itself exited
                 app.logger.info(f"Shell process (PID: {shell_pid}) exited during wait.")
-                return jsonify({"status": "success", "message": "Shell process exited during command execution."})
+                completion_message = "Shell process exited during command execution."
+                command_completed_normally = True # Or consider it a form of completion
+                break
 
             # Platform-specific command completion check
             if sys.platform == "darwin": # macOS
@@ -183,22 +251,78 @@ def push_keystroke_sync():
                     app.logger.debug(f"Polling PTY's foreground PGID: {current_foreground_pgid}. Shell's PGID: {shell_pgid}.")
                 except OSError as e:
                     app.logger.error(f"Error calling tcgetpgrp on slave_fd ({slave_fd}): {e} (errno: {e.errno}). Assuming command finished or error.")
-                    if proc.poll() is not None: 
-                         return jsonify({"status": "success", "message": "Shell process exited, PTY state uncertain."})
+                    # If tcgetpgrp fails, check if shell exited. If so, consider command done.
+                    if proc.poll() is not None:
+                        completion_message = "Shell process exited, PTY state uncertain after tcgetpgrp error."
+                        command_completed_normally = True
+                        break
+                    # If shell still running, this is an error with PTY state.
                     return jsonify({"status": "error", "message": f"Error checking PTY foreground process group: {e}"}), 500
 
                 if current_foreground_pgid == shell_pgid:
                     app.logger.info(f"Shell (PGID {shell_pgid}) is foreground process group on PTY. Command considered complete.")
-                    return jsonify({"status": "success", "message": "Command completed."})
+                    completion_message = "Command completed."
+                    command_completed_normally = True
+                    break
             
             time.sleep(0.5) # Polling interval
+        
+        # After loop: either completed, timed out, or shell exited.
+        if not command_completed_normally and proc.poll() is None: # Timeout
+            app.logger.warning(f"Timeout waiting for command completion (Shell PGID: {shell_pgid} did not become foreground).")
+            completion_message = f"Command did not complete within {MAX_SYNC_WAIT_SECONDS} seconds."
+            status_code = 503 
+            result_status = "timeout"
+        elif not command_completed_normally and proc.poll() is not None: # Shell exited during loop but not caught as completion
+             app.logger.info(f"Shell process (PID: {shell_pid}) exited during wait (final check).")
+             completion_message = "Shell process exited during command execution (final check)."
+             status_code = 200
+             result_status = "success" # Or "shell_exited"
+        else: # Command completed normally or shell exited and was marked as completion
+            status_code = 200
+            result_status = "success"
 
-        app.logger.warning(f"Timeout waiting for command completion (Shell PGID: {shell_pgid} did not become foreground).")
-        return jsonify({"status": "timeout", "message": f"Command did not complete within {MAX_SYNC_WAIT_SECONDS} seconds."}), 503
+        # Capture the output lines
+        with pyte_listener_lock:
+            lines_after_command_effect = list(pyte_listener_lines)
+            final_current_line = current_line_buffer_for_listener
+            
+            # Construct the output segment from the point the command started affecting the log
+            output_segment = lines_after_command_effect[len(lines_before_command_effect):]
+            if final_current_line: # Add the last incomplete line (new prompt, or partial output)
+                output_segment.append(final_current_line)
+
+            # Reset log for the next command: keep only the new prompt line
+            if final_current_line:
+                pyte_listener_lines = [final_current_line]
+                current_line_buffer_for_listener = ""
+            else:
+                # If final_current_line is empty, it means the last output ended with \n or \r.
+                # The last entry in pyte_listener_lines (if any) would be that line.
+                if pyte_listener_lines: # Check if list is not empty
+                    # If lines_after_command_effect is not empty, its last element is the last complete line
+                    if lines_after_command_effect:
+                         pyte_listener_lines = [lines_after_command_effect[-1]]
+                    else: # Edge case: log was empty, current line empty.
+                         pyte_listener_lines = []
+                else: # Log was already empty.
+                    pyte_listener_lines = []
+                current_line_buffer_for_listener = ""
+        
+        return jsonify({"status": result_status, "message": completion_message, "output": output_segment}), status_code
 
     except ProcessLookupError: # os.getpgid(proc.pid) can fail if proc died just before the call
         app.logger.error("Shell process disappeared unexpectedly (ProcessLookupError) during /keystroke_sync.")
-        return jsonify({"status": "error", "message": "Shell process disappeared unexpectedly."}), 500
+        # Attempt to capture output anyway
+        with pyte_listener_lock:
+            lines_after_command_effect = list(pyte_listener_lines)
+            final_current_line = current_line_buffer_for_listener
+            output_segment = lines_after_command_effect[len(lines_before_command_effect):] # Use previously captured lines_before_command_effect
+            if final_current_line: output_segment.append(final_current_line)
+            # Reset log
+            if final_current_line: pyte_listener_lines = [final_current_line]; current_line_buffer_for_listener = ""
+            else: pyte_listener_lines = []; current_line_buffer_for_listener = ""
+        return jsonify({"status": "error", "message": "Shell process disappeared unexpectedly.", "output": output_segment}), 500
     except OSError as e: # os.write, or other os calls if PTY state is bad
         app.logger.error(f"OSError during /keystroke_sync: {e}")
         # Check if it's an EIO error, which often means the PTY is gone
@@ -422,9 +546,9 @@ def main():
         # The parent's copy of slave_fd is not directly used for read/write by the parent,
         # but it needs to be kept open until the child is done, then closed by cleanup.
 
-        # Initialize pyte screen and stream
+        # Initialize pyte screen and our custom logging stream
         screen = pyte.Screen(cols, lines)
-        stream = pyte.Stream(screen)
+        stream = LoggingStream(screen) # Use the custom stream
         pty_running = True  # Set flag before starting thread
 
         # Start the PTY reader thread
