@@ -63,29 +63,33 @@ class LoggingStream(pyte.Stream):
         with pyte_listener_lock:
             if char == "\n":
                 if verbose_logging_enabled:
-                    app.logger.debug(f"Verbose LoggingStream: Adding line on LF: '{current_line_buffer_for_listener}'")
+                    app.logger.debug(f"Verbose LoggingStream LF: About to append CBL ('{current_line_buffer_for_listener}') to PLL (len {len(pyte_listener_lines)}): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
                 pyte_listener_lines.append(current_line_buffer_for_listener)
                 current_line_buffer_for_listener = ""
                 if verbose_logging_enabled:
-                    app.logger.debug(f"Verbose LoggingStream: Cleared current_line_buffer_for_listener after LF.")
+                    app.logger.debug(f"Verbose LoggingStream LF: After append, PLL (len {len(pyte_listener_lines)}) is {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}, CBL is ('{current_line_buffer_for_listener}')")
             elif char == "\r":
                 # Carriage return: current line is considered finished. Add it to the list.
                 if verbose_logging_enabled:
-                    app.logger.debug(f"Verbose LoggingStream: Adding line on CR: '{current_line_buffer_for_listener}'")
+                    app.logger.debug(f"Verbose LoggingStream CR: About to append CBL ('{current_line_buffer_for_listener}') to PLL (len {len(pyte_listener_lines)}): {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}")
                 pyte_listener_lines.append(current_line_buffer_for_listener) # Always append, even if empty
                 current_line_buffer_for_listener = ""
                 if verbose_logging_enabled:
-                    app.logger.debug(f"Verbose LoggingStream: Cleared current_line_buffer_for_listener after CR.")
+                    app.logger.debug(f"Verbose LoggingStream CR: After append, PLL (len {len(pyte_listener_lines)}) is {pyte_listener_lines[-3:] if len(pyte_listener_lines) > 3 else pyte_listener_lines}, CBL is ('{current_line_buffer_for_listener}')")
             elif char == "\x08":  # Backspace
                 if current_line_buffer_for_listener:
+                    if verbose_logging_enabled:
+                        app.logger.debug(f"Verbose LoggingStream BS: CBL before: '{current_line_buffer_for_listener}'")
                     current_line_buffer_for_listener = current_line_buffer_for_listener[:-1]
                     if verbose_logging_enabled:
-                        app.logger.debug(f"Verbose LoggingStream: current_line_buffer after BS: '{current_line_buffer_for_listener}'")
+                        app.logger.debug(f"Verbose LoggingStream BS: CBL after: '{current_line_buffer_for_listener}'")
             # Check if it's a printable char (not a control character)
             elif not unicodedata.category(char).startswith('C'):
+                if verbose_logging_enabled:
+                    app.logger.debug(f"Verbose LoggingStream CHAR: About to add char '{char.encode('unicode_escape').decode()}' to CBL ('{current_line_buffer_for_listener}')")
                 current_line_buffer_for_listener += char
                 if verbose_logging_enabled:
-                    app.logger.debug(f"Verbose LoggingStream: current_line_buffer after char '{char.encode('unicode_escape').decode()}': '{current_line_buffer_for_listener}'")
+                    app.logger.debug(f"Verbose LoggingStream CHAR: After add, CBL is ('{current_line_buffer_for_listener}')")
             # Else: it's a control character (like ESC, etc.) not explicitly handled for the log.
             # It was still processed by super().dispatch() for pyte.Screen.
 
@@ -195,18 +199,19 @@ def push_keystroke_sync():
             with pyte_listener_lock:
                 lines_after_command_effect = list(pyte_listener_lines)
                 final_current_line = current_line_buffer_for_listener
+                app.logger.debug(f"SYNC (shell exited path): lines_after_command_effect (len {len(lines_after_command_effect)}): {lines_after_command_effect[-5:] if len(lines_after_command_effect) > 5 else lines_after_command_effect}")
+                app.logger.debug(f"SYNC (shell exited path): final_current_line: '{final_current_line}'")
                 
                 output_segment = lines_after_command_effect[len(lines_before_command_effect):]
                 if final_current_line: # Add the last incomplete line (new prompt, or partial output)
                     output_segment.append(final_current_line)
 
-                # Reset log for next command
-                if final_current_line:
-                    pyte_listener_lines = [final_current_line]
-                    current_line_buffer_for_listener = ""
-                else:
-                    pyte_listener_lines = []
-                    current_line_buffer_for_listener = ""
+                # Reset log for next command - consistent with main path
+                current_line_buffer_for_listener = final_current_line
+                pyte_listener_lines = []
+                app.logger.debug(f"SYNC (shell exited path): Reset CBL to '{current_line_buffer_for_listener}', PLL to empty.")
+
+            app.logger.debug(f"SYNC (shell exited path): Returning output_segment (len {len(output_segment)}): {output_segment[-5:] if len(output_segment) > 5 else output_segment}")
             return jsonify({"status": "success", "message": "Shell process exited shortly after command submission.", "output": output_segment})
 
         shell_pid = proc.pid
