@@ -204,40 +204,44 @@ def cleanup_pty_and_process():
     """
     Cleans up the PTY file descriptors and terminates the subprocess.
     """
-    global pty_running, proc, master_fd, slave_fd, pty_thread
+    global pty_running, proc, master_fd, slave_fd, pty_thread, app
 
-    print("Initiating cleanup...")
+    # Use app.logger if available, otherwise fallback to print
+    log_func = app.logger.info if app and hasattr(app, 'logger') else print
+
+    log_func("Initiating cleanup...")
     pty_running = False  # Signal PTY reader thread to stop
 
     # Wait for PTY reader thread to finish
     if pty_thread and pty_thread.is_alive():
-        print("Waiting for PTY reader thread to exit...")
+        log_func("Waiting for PTY reader thread to exit...")
         pty_thread.join(timeout=1.0) # Wait for a short period
         if pty_thread.is_alive():
-            print("PTY reader thread did not exit gracefully.")
+            log_func("PTY reader thread did not exit gracefully.")
 
     # Terminate the subprocess (shell and its children)
     if proc and proc.poll() is None:  # Check if process is still running
-        shell_pgid = os.getpgid(proc.pid) # Get PGID before it potentially exits
-        print(f"Terminating shell process tree (PGID: {shell_pgid})...")
+        shell_pgid = -1 # Default value
         try:
+            shell_pgid = os.getpgid(proc.pid) # Get PGID before it potentially exits
+            log_func(f"Terminating shell process tree (PGID: {shell_pgid})...")
             os.killpg(shell_pgid, signal.SIGTERM)  # Send SIGTERM to the process group
             proc.wait(timeout=2)  # Wait for graceful termination
         except ProcessLookupError:
-            print(f"Shell process group (PGID: {shell_pgid}) already exited.")
+            log_func(f"Shell process group (PGID: {shell_pgid if shell_pgid != -1 else 'unknown'}) already exited.")
         except subprocess.TimeoutExpired:
-            print(f"Shell process tree (PGID: {shell_pgid}) did not terminate gracefully with SIGTERM, sending SIGKILL...")
+            log_func(f"Shell process tree (PGID: {shell_pgid}) did not terminate gracefully with SIGTERM, sending SIGKILL...")
             try:
                 os.killpg(shell_pgid, signal.SIGKILL)  # Force kill
                 proc.wait(timeout=2)  # Wait for forced termination
             except ProcessLookupError: # Could have exited between SIGTERM and SIGKILL
-                print(f"Shell process group (PGID: {shell_pgid}) already exited before SIGKILL.")
+                log_func(f"Shell process group (PGID: {shell_pgid}) already exited before SIGKILL.")
             except Exception as e_kill:
-                print(f"Error force killing process group (PGID: {shell_pgid}): {e_kill}")
-        except Exception as e_term:
-            print(f"Error terminating process group (PGID: {shell_pgid}): {e_term}")
+                log_func(f"Error force killing process group (PGID: {shell_pgid}): {e_kill}")
+        except Exception as e_term: # Includes OSError if os.getpgid fails before assignment
+            log_func(f"Error terminating process group (PGID: {shell_pgid if shell_pgid != -1 else 'unknown'}): {e_term}")
     elif proc:
-        print("Shell process already terminated.")
+        log_func("Shell process already terminated.")
     proc = None # Mark as handled
 
     # Close PTY file descriptors
@@ -245,30 +249,34 @@ def cleanup_pty_and_process():
     temp_master_fd = master_fd
     master_fd = None
     if temp_master_fd is not None:
-        print("Closing master PTY FD.")
+        log_func("Closing master PTY FD.")
         try:
             os.close(temp_master_fd)
         except OSError as e:
-            print(f"Error closing master_fd: {e}")
+            log_func(f"Error closing master_fd: {e}")
 
     temp_slave_fd = slave_fd # slave_fd is the one created by openpty, not used directly after Popen
     slave_fd = None
     if temp_slave_fd is not None:
-        print("Closing slave PTY FD (parent's copy).")
+        log_func("Closing slave PTY FD (parent's copy).")
         try:
             os.close(temp_slave_fd)
         except OSError as e:
-            print(f"Error closing slave_fd: {e}")
+            log_func(f"Error closing slave_fd: {e}")
     
-    print("Cleanup finished.")
+    log_func("Cleanup finished.")
 
 # --- Signal Handler for Ctrl+C ---
 def sigint_handler(sig, frame):
     """
-    Handles SIGINT (Ctrl+C). Initiates process termination and raises KeyboardInterrupt.
+    Handles SIGINT (Ctrl+C). Initiates process termination and exits.
     """
-    global proc, pty_running
-    print("\nCtrl+C received by signal handler. Initiating shutdown sequence.")
+    global proc, pty_running, app # Ensure app is accessible for logging
+
+    # Use app.logger if available, otherwise fallback to print
+    log_func = app.logger.info if app and hasattr(app, 'logger') else print
+
+    log_func("\nCtrl+C received by signal handler. Initiating shutdown sequence.")
     
     pty_running = False # Signal PTY reader thread to stop ASAP
 
@@ -276,17 +284,24 @@ def sigint_handler(sig, frame):
         pgid_to_signal = -1
         try:
             pgid_to_signal = os.getpgid(proc.pid)
-            print(f"SIGINT: Terminating shell process tree (PGID: {pgid_to_signal}) immediately...")
+            log_func(f"SIGINT: Terminating shell process tree (PGID: {pgid_to_signal}) immediately...")
             # Send SIGTERM to the entire process group of the shell
             os.killpg(pgid_to_signal, signal.SIGTERM)
         except ProcessLookupError:
-             print(f"SIGINT: Shell process (PGID: {pgid_to_signal if pgid_to_signal != -1 else 'unknown'}) already exited.")
+             log_func(f"SIGINT: Shell process (PGID: {pgid_to_signal if pgid_to_signal != -1 else 'unknown'}) already exited.")
         except Exception as e:
-            print(f"SIGINT: Error sending SIGTERM to process group (PGID: {pgid_to_signal if pgid_to_signal != -1 else 'unknown'}): {e}")
+            log_func(f"SIGINT: Error sending SIGTERM to process group (PGID: {pgid_to_signal if pgid_to_signal != -1 else 'unknown'}): {e}")
     
-    # Raising KeyboardInterrupt allows Flask to perform its own shutdown,
-    # and then the `finally` block in `main()` will execute `cleanup_pty_and_process`.
-    raise KeyboardInterrupt
+    # Raising KeyboardInterrupt would normally be caught by main's try/except.
+    # However, if Flask/Werkzeug interferes with this, a more direct approach is needed.
+    
+    log_func("SIGINT handler: Performing direct cleanup and exiting.")
+    cleanup_pty_and_process() # Call cleanup directly.
+    
+    # Exit the entire process.
+    # sys.exit(0) attempts a clean exit.
+    # os._exit(0) is a more forceful exit that bypasses most cleanup; use if sys.exit hangs.
+    sys.exit(0)
 
 # --- Main Application ---
 def main():
@@ -364,14 +379,27 @@ def main():
         # debug=True enables Flask's debugger and more verbose logging.
         app.run(host='127.0.0.1', port=5399, debug=True, use_reloader=False)
 
-    except KeyboardInterrupt:
-        print("KeyboardInterrupt caught in main. Shutting down...")
+    except KeyboardInterrupt: # This might not be reached if sigint_handler exits directly
+        app.logger.info("KeyboardInterrupt caught in main. Shutting down...")
     except Exception as e:
-        print(f"An unexpected error occurred in main: {e}")
+        app.logger.error(f"An unexpected error occurred in main: {e}", exc_info=True)
     finally:
-        print("Main finally block: Performing cleanup...")
-        cleanup_pty_and_process()
-        print("Application finished.")
+        # This finally block will run if KeyboardInterrupt is caught by main,
+        # or if app.run() exits normally, or if another exception occurs in main's try block.
+        # If sigint_handler calls sys.exit(), this finally block in main might not run.
+        app.logger.info("Main finally block reached.")
+        # cleanup_pty_and_process is now primarily called from sigint_handler for Ctrl+C.
+        # Call it here to handle non-Ctrl+C exits or if sigint_handler failed to fully cleanup.
+        # cleanup_pty_and_process should be idempotent.
+        if pty_running: # If pty_running is still true, sigint_handler might not have run or completed.
+            app.logger.info("Main finally block: pty_running is true, ensuring cleanup.")
+            cleanup_pty_and_process()
+        else:
+            # If pty_running is false, cleanup was likely initiated by sigint_handler.
+            # A second call to an idempotent cleanup_pty_and_process is generally safe if needed,
+            # but we rely on the signal handler's call for Ctrl+C.
+            app.logger.info("Main finally block: pty_running is false, cleanup likely handled by sigint_handler or already in progress.")
+        app.logger.info("Application finished.")
 
 if __name__ == '__main__':
     main()
