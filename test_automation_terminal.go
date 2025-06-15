@@ -1000,6 +1000,9 @@ func main() {
 	}
 
 	if mcpMode {
+		// Always enable verbose logging in MCP mode
+		verboseLoggingEnabled = true
+		
 		// Open MCP log file for debug output
 		var err error
 		mcpLogFile, err = os.OpenFile("/tmp/linux_terminal_mcp.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
