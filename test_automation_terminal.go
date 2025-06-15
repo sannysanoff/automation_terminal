@@ -1315,17 +1315,39 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 		logDebug("BEGIN: Using default image ID: %s", imageID)
 	}
 
-	// Run Docker container with keepalive mode
-	logInfo("Starting Docker container with image: %s", imageID)
-	logDebug("BEGIN: Creating docker run command")
-	cmd := exec.Command("docker", "run", "--rm", "-it", "-p", ":5399", "-e", "KEEPALIVE=true", imageID)
-	logDebug("BEGIN: Docker command: %v", cmd.Args)
+	// Create Docker container first to get container ID
+	logInfo("Creating Docker container with image: %s", imageID)
+	logDebug("BEGIN: Creating docker create command")
+	createCmd := exec.Command("docker", "create", "-it", "-p", ":5399", "-e", "KEEPALIVE=true", imageID)
+	logDebug("BEGIN: Docker create command: %v", createCmd.Args)
+	
+	logDebug("BEGIN: Executing docker create")
+	createOutput, err := createCmd.Output()
+	if err != nil {
+		logDebug("BEGIN: Failed to create Docker container: %v", err)
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to create Docker container: %v", err)), nil
+	}
+
+	containerID := strings.TrimSpace(string(createOutput))
+	logDebug("BEGIN: Created container ID: %s", containerID)
+	if containerID == "" {
+		logDebug("BEGIN: Docker create returned empty container ID")
+		return mcp.NewToolResultError("Docker create command returned empty container ID"), nil
+	}
+
+	// Now start the container interactively
+	logInfo("Starting Docker container with ID: %s", containerID)
+	logDebug("BEGIN: Creating docker start command")
+	cmd := exec.Command("docker", "start", "-ai", containerID)
+	logDebug("BEGIN: Docker start command: %v", cmd.Args)
 
 	// Get stdin pipe to send pong responses
 	logDebug("BEGIN: Getting stdin pipe for Docker container")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		logDebug("BEGIN: Failed to get stdin pipe: %v", err)
+		// Clean up the created container
+		exec.Command("docker", "rm", containerID).Run()
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get stdin pipe: %v", err)), nil
 	}
 
@@ -1335,6 +1357,8 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	if err != nil {
 		logDebug("BEGIN: Failed to get stdout pipe: %v", err)
 		stdin.Close()
+		// Clean up the created container
+		exec.Command("docker", "rm", containerID).Run()
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get stdout pipe: %v", err)), nil
 	}
 
@@ -1343,6 +1367,8 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	if err := cmd.Start(); err != nil {
 		logDebug("BEGIN: Failed to start Docker container: %v", err)
 		stdin.Close()
+		// Clean up the created container
+		exec.Command("docker", "rm", containerID).Run()
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to start Docker container: %v", err)), nil
 	}
 
@@ -1352,28 +1378,6 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	// Wait a moment for container to start
 	logDebug("BEGIN: Waiting 2 seconds for container to initialize")
 	time.Sleep(2 * time.Second)
-
-	// Get container ID by finding the running container with our image
-	logDebug("BEGIN: Looking up container ID for image: %s", imageID)
-	listCmd := exec.Command("docker", "ps", "--filter", fmt.Sprintf("ancestor=%s", imageID), "--format", "{{.ID}}")
-	logDebug("BEGIN: Running command: %v", listCmd.Args)
-	listOutput, err := listCmd.Output()
-	if err != nil {
-		logDebug("BEGIN: Failed to list Docker containers: %v", err)
-		cmd.Process.Kill()
-		stdin.Close()
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to list Docker containers: %v", err)), nil
-	}
-
-	containerID := strings.TrimSpace(string(listOutput))
-	logDebug("BEGIN: Container lookup output: '%s'", containerID)
-	if containerID == "" {
-		logDebug("BEGIN: No container ID found, killing process")
-		cmd.Process.Kill()
-		stdin.Close()
-		return mcp.NewToolResultError("Failed to find running container ID"), nil
-	}
-	logDebug("BEGIN: Found container ID: %s", containerID)
 
 	// Get port mapping
 	logDebug("BEGIN: Inspecting container ports for container: %s", containerID)
