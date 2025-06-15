@@ -63,6 +63,8 @@ var (
 	dockerHostPort    string
 	dockerRunning     bool
 	dockerMutex       sync.Mutex
+	dockerCmd         *exec.Cmd
+	dockerStdin       io.WriteCloser
 	
 	// CLI mode configuration
 	cliMode    bool
@@ -1283,37 +1285,64 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 		imageID = id
 	}
 
-	// Run Docker container
+	// Run Docker container with keepalive mode
 	logInfo("Starting Docker container with image: %s", imageID)
-	cmd := exec.Command("docker", "run", "-d", "--rm", "-it", "-p", ":5399", imageID)
-	output, err := cmd.Output()
+	cmd := exec.Command("docker", "run", "--rm", "-it", "-p", ":5399", "-e", "KEEPALIVE=true", imageID)
+	
+	// Get stdin pipe to send pong responses
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to get stdin pipe: %v", err)), nil
+	}
+	
+	// Get stdout pipe to read ping messages
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		stdin.Close()
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to get stdout pipe: %v", err)), nil
+	}
+	
+	// Start the container
+	if err := cmd.Start(); err != nil {
+		stdin.Close()
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to start Docker container: %v", err)), nil
 	}
 
-	containerID := strings.TrimSpace(string(output))
-	if containerID == "" {
-		return mcp.NewToolResultError("Docker run command returned empty container ID"), nil
-	}
-
-	logInfo("Docker container started with ID: %s", containerID)
+	logInfo("Docker container started with PID: %d", cmd.Process.Pid)
 
 	// Wait a moment for container to start
 	time.Sleep(2 * time.Second)
+
+	// Get container ID by finding the running container with our image
+	listCmd := exec.Command("docker", "ps", "--filter", fmt.Sprintf("ancestor=%s", imageID), "--format", "{{.ID}}")
+	listOutput, err := listCmd.Output()
+	if err != nil {
+		cmd.Process.Kill()
+		stdin.Close()
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to list Docker containers: %v", err)), nil
+	}
+
+	containerID := strings.TrimSpace(string(listOutput))
+	if containerID == "" {
+		cmd.Process.Kill()
+		stdin.Close()
+		return mcp.NewToolResultError("Failed to find running container ID"), nil
+	}
 
 	// Get port mapping
 	inspectCmd := exec.Command("docker", "inspect", "--format={{json .NetworkSettings.Ports}}", containerID)
 	portOutput, err := inspectCmd.Output()
 	if err != nil {
-		// Clean up container on failure
-		exec.Command("docker", "stop", containerID).Run()
+		cmd.Process.Kill()
+		stdin.Close()
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to inspect Docker container ports: %v", err)), nil
 	}
 
 	// Parse port mapping JSON
 	var ports map[string][]map[string]string
 	if err := json.Unmarshal(portOutput, &ports); err != nil {
-		exec.Command("docker", "stop", containerID).Run()
+		cmd.Process.Kill()
+		stdin.Close()
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to parse port mapping JSON: %v", err)), nil
 	}
 
@@ -1324,7 +1353,8 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	}
 
 	if hostPort == "" {
-		exec.Command("docker", "stop", containerID).Run()
+		cmd.Process.Kill()
+		stdin.Close()
 		return mcp.NewToolResultError("Failed to find host port mapping for 5399/tcp"), nil
 	}
 
@@ -1332,9 +1362,14 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	dockerContainerID = containerID
 	dockerHostPort = hostPort
 	dockerRunning = true
+	dockerCmd = cmd
+	dockerStdin = stdin
 
 	// Update mcpServerAddr to use the new port
 	mcpServerAddr = fmt.Sprintf("http://localhost:%s", hostPort)
+
+	// Start goroutine to handle ping/pong communication
+	go handleDockerKeepalive(stdout, stdin)
 
 	logInfo("Docker container ready. Host port: %s, Container ID: %s", hostPort, containerID)
 
@@ -1377,14 +1412,37 @@ func cleanupDockerContainer() {
 	dockerMutex.Lock()
 	defer dockerMutex.Unlock()
 	
-	if dockerRunning && dockerContainerID != "" {
+	if dockerRunning {
 		logInfo("Cleaning up Docker container: %s", dockerContainerID)
-		cmd := exec.Command("docker", "stop", dockerContainerID)
-		if err := cmd.Run(); err != nil {
-			logWarn("Failed to stop Docker container %s: %v", dockerContainerID, err)
-		} else {
-			logInfo("Docker container %s stopped successfully", dockerContainerID)
+		
+		// Close stdin to signal container to exit
+		if dockerStdin != nil {
+			dockerStdin.Close()
+			dockerStdin = nil
 		}
+		
+		// Wait for container process to exit or kill it
+		if dockerCmd != nil && dockerCmd.Process != nil {
+			done := make(chan error, 1)
+			go func() {
+				done <- dockerCmd.Wait()
+			}()
+			
+			select {
+			case err := <-done:
+				if err != nil {
+					logWarn("Docker container exited with error: %v", err)
+				} else {
+					logInfo("Docker container exited gracefully")
+				}
+			case <-time.After(5 * time.Second):
+				logWarn("Docker container did not exit gracefully, killing process")
+				dockerCmd.Process.Kill()
+				<-done // Wait for process to be killed
+			}
+			dockerCmd = nil
+		}
+		
 		dockerRunning = false
 		dockerContainerID = ""
 		dockerHostPort = ""
@@ -1844,4 +1902,38 @@ func runKeepaliveMode() {
 			}
 		}
 	}
+}
+
+// --- Docker Keepalive Handler ---
+
+func handleDockerKeepalive(stdout io.Reader, stdin io.Writer) {
+	logInfo("Starting Docker keepalive handler")
+	scanner := bufio.NewScanner(stdout)
+	
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		logDebug("Docker stdout: %s", line)
+		
+		if line == "ping" {
+			logDebug("Received ping from Docker container, sending pong")
+			if _, err := stdin.Write([]byte("pong\n")); err != nil {
+				logError("Failed to send pong to Docker container: %v", err)
+				break
+			}
+		}
+	}
+	
+	if err := scanner.Err(); err != nil {
+		logError("Error reading from Docker stdout: %v", err)
+	}
+	
+	logInfo("Docker keepalive handler exited")
+	
+	// If we exit the keepalive handler, the container likely died
+	dockerMutex.Lock()
+	if dockerRunning {
+		logWarn("Docker container communication lost, marking as not running")
+		dockerRunning = false
+	}
+	dockerMutex.Unlock()
 }
