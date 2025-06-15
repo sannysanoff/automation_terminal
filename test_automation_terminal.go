@@ -60,14 +60,15 @@ var (
 	mcpLogFile    *os.File                           // Log file for MCP mode debug output
 
 	// Docker container management for MCP mode
-	dockerContainerID string
-	dockerHostPort    string
-	dockerRunning     bool
-	dockerMutex       sync.Mutex
-	dockerCmd         *exec.Cmd
-	dockerStdin       io.WriteCloser
-	dockerDied        chan struct{} // Signal when Docker container dies
-	mcpShutdown       chan struct{} // Signal for graceful MCP shutdown
+	dockerContainerID   string
+	dockerHostPort      string
+	dockerRunning       bool
+	dockerMutex         sync.Mutex
+	dockerCmd           *exec.Cmd
+	dockerStdin         io.WriteCloser
+	dockerDied          chan struct{} // Signal when Docker container dies
+	dockerKeepaliveDone chan struct{} // Signal to stop keepalive handler
+	mcpShutdown         chan struct{} // Signal for graceful MCP shutdown
 
 	// CLI mode configuration
 	cliMode    bool
@@ -1339,8 +1340,16 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 		logInfo("BEGIN: Existing workspace is running, closing it before starting new one")
 		logDebug("BEGIN: Container already running, cleaning up first")
 		
+		// Signal keepalive handler to stop first
+		if dockerKeepaliveDone != nil {
+			logDebug("BEGIN: Signaling keepalive handler to stop")
+			close(dockerKeepaliveDone)
+			dockerKeepaliveDone = nil
+		}
+		
 		// Close stdin to signal container to exit
 		if dockerStdin != nil {
+			logDebug("BEGIN: Closing Docker stdin")
 			dockerStdin.Close()
 			dockerStdin = nil
 		}
@@ -1511,6 +1520,9 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	mcpServerAddr = fmt.Sprintf("http://localhost:%s", hostPort)
 	logDebug("BEGIN: Updated server address from %s to %s", oldServerAddr, mcpServerAddr)
 
+	// Initialize keepalive done channel
+	dockerKeepaliveDone = make(chan struct{})
+
 	// Start goroutine to handle ping/pong communication
 	logDebug("BEGIN: Starting Docker keepalive handler goroutine")
 	go handleDockerKeepalive(stdout, stdin)
@@ -1585,8 +1597,16 @@ func cleanupDockerContainer() {
 	if dockerRunning {
 		logInfo("Cleaning up Docker container: %s", dockerContainerID)
 
+		// Signal keepalive handler to stop first
+		if dockerKeepaliveDone != nil {
+			logDebug("Signaling keepalive handler to stop")
+			close(dockerKeepaliveDone)
+			dockerKeepaliveDone = nil
+		}
+
 		// Close stdin to signal container to exit
 		if dockerStdin != nil {
+			logDebug("Closing Docker stdin")
 			dockerStdin.Close()
 			dockerStdin = nil
 		}
@@ -2147,26 +2167,48 @@ func handleDockerKeepalive(stdout io.Reader, stdin io.Writer) {
 	logInfo("Starting Docker keepalive handler")
 	scanner := bufio.NewScanner(stdout)
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		logDebug("Docker stdout: %s", line)
+	// Create a channel to signal when scanning is done
+	scanDone := make(chan struct{})
+	
+	// Start scanning in a separate goroutine
+	go func() {
+		defer close(scanDone)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			logDebug("Docker stdout: %s", line)
 
-		if line == "ping" {
-			logDebug("Received ping from Docker container, sending pong")
-			if _, err := stdin.Write([]byte("pong\n")); err != nil {
-				logError("Failed to send pong to Docker container: %v", err)
-				break
+			if line == "ping" {
+				logDebug("Received ping from Docker container, sending pong")
+				
+				// Check if we should stop before writing
+				select {
+				case <-dockerKeepaliveDone:
+					logDebug("Keepalive handler stopping, not sending pong")
+					return
+				default:
+				}
+				
+				if _, err := stdin.Write([]byte("pong\n")); err != nil {
+					logError("Failed to send pong to Docker container: %v", err)
+					return
+				}
 			}
 		}
+	}()
+
+	// Wait for either scan completion or stop signal
+	select {
+	case <-scanDone:
+		if err := scanner.Err(); err != nil {
+			logError("Error reading from Docker stdout: %v", err)
+		}
+		logInfo("Docker keepalive handler exited due to stdout close")
+	case <-dockerKeepaliveDone:
+		logInfo("Docker keepalive handler exited due to stop signal")
+		return
 	}
 
-	if err := scanner.Err(); err != nil {
-		logError("Error reading from Docker stdout: %v", err)
-	}
-
-	logInfo("Docker keepalive handler exited")
-
-	// If we exit the keepalive handler, the container likely died
+	// If we exit the keepalive handler due to stdout close, the container likely died
 	dockerMutex.Lock()
 	if dockerRunning {
 		logWarn("Docker container communication lost, marking as not running")
