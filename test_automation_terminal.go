@@ -1296,11 +1296,13 @@ func oobExecToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.
 }
 
 func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	logDebug("BEGIN: Starting begin tool handler")
 	dockerMutex.Lock()
 	defer dockerMutex.Unlock()
 	
 	// Check if container is already running
 	if dockerRunning {
+		logDebug("BEGIN: Container already running, returning error")
 		return mcp.NewToolResultError("Workspace is already running. Use 'save_work' to commit changes or stop the current workspace first."), nil
 	}
 
@@ -1308,82 +1310,112 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	imageID := "sannysanoff/automation_terminal"
 	if id, err := request.RequireString("workspace_id"); err == nil && id != "" {
 		imageID = id
+		logDebug("BEGIN: Using custom image ID: %s", imageID)
+	} else {
+		logDebug("BEGIN: Using default image ID: %s", imageID)
 	}
 
 	// Run Docker container with keepalive mode
 	logInfo("Starting Docker container with image: %s", imageID)
+	logDebug("BEGIN: Creating docker run command")
 	cmd := exec.Command("docker", "run", "--rm", "-it", "-p", ":5399", "-e", "KEEPALIVE=true", imageID)
+	logDebug("BEGIN: Docker command: %v", cmd.Args)
 	
 	// Get stdin pipe to send pong responses
+	logDebug("BEGIN: Getting stdin pipe for Docker container")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		logDebug("BEGIN: Failed to get stdin pipe: %v", err)
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get stdin pipe: %v", err)), nil
 	}
 	
 	// Get stdout pipe to read ping messages
+	logDebug("BEGIN: Getting stdout pipe for Docker container")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		logDebug("BEGIN: Failed to get stdout pipe: %v", err)
 		stdin.Close()
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get stdout pipe: %v", err)), nil
 	}
 	
 	// Start the container
+	logDebug("BEGIN: Starting Docker container")
 	if err := cmd.Start(); err != nil {
+		logDebug("BEGIN: Failed to start Docker container: %v", err)
 		stdin.Close()
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to start Docker container: %v", err)), nil
 	}
 
 	logInfo("Docker container started with PID: %d", cmd.Process.Pid)
+	logDebug("BEGIN: Docker container started successfully with PID: %d", cmd.Process.Pid)
 
 	// Wait a moment for container to start
+	logDebug("BEGIN: Waiting 2 seconds for container to initialize")
 	time.Sleep(2 * time.Second)
 
 	// Get container ID by finding the running container with our image
+	logDebug("BEGIN: Looking up container ID for image: %s", imageID)
 	listCmd := exec.Command("docker", "ps", "--filter", fmt.Sprintf("ancestor=%s", imageID), "--format", "{{.ID}}")
+	logDebug("BEGIN: Running command: %v", listCmd.Args)
 	listOutput, err := listCmd.Output()
 	if err != nil {
+		logDebug("BEGIN: Failed to list Docker containers: %v", err)
 		cmd.Process.Kill()
 		stdin.Close()
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to list Docker containers: %v", err)), nil
 	}
 
 	containerID := strings.TrimSpace(string(listOutput))
+	logDebug("BEGIN: Container lookup output: '%s'", containerID)
 	if containerID == "" {
+		logDebug("BEGIN: No container ID found, killing process")
 		cmd.Process.Kill()
 		stdin.Close()
 		return mcp.NewToolResultError("Failed to find running container ID"), nil
 	}
+	logDebug("BEGIN: Found container ID: %s", containerID)
 
 	// Get port mapping
+	logDebug("BEGIN: Inspecting container ports for container: %s", containerID)
 	inspectCmd := exec.Command("docker", "inspect", "--format={{json .NetworkSettings.Ports}}", containerID)
+	logDebug("BEGIN: Running command: %v", inspectCmd.Args)
 	portOutput, err := inspectCmd.Output()
 	if err != nil {
+		logDebug("BEGIN: Failed to inspect Docker container ports: %v", err)
 		cmd.Process.Kill()
 		stdin.Close()
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to inspect Docker container ports: %v", err)), nil
 	}
 
+	logDebug("BEGIN: Port inspection output: %s", string(portOutput))
 	// Parse port mapping JSON
 	var ports map[string][]map[string]string
 	if err := json.Unmarshal(portOutput, &ports); err != nil {
+		logDebug("BEGIN: Failed to parse port mapping JSON: %v", err)
 		cmd.Process.Kill()
 		stdin.Close()
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to parse port mapping JSON: %v", err)), nil
 	}
 
+	logDebug("BEGIN: Parsed ports: %+v", ports)
 	// Extract host port for 5399/tcp
 	hostPort := ""
 	if tcpPorts, exists := ports["5399/tcp"]; exists && len(tcpPorts) > 0 {
 		hostPort = tcpPorts[0]["HostPort"]
+		logDebug("BEGIN: Found host port: %s", hostPort)
+	} else {
+		logDebug("BEGIN: No port mapping found for 5399/tcp")
 	}
 
 	if hostPort == "" {
+		logDebug("BEGIN: Host port is empty, killing process")
 		cmd.Process.Kill()
 		stdin.Close()
 		return mcp.NewToolResultError("Failed to find host port mapping for 5399/tcp"), nil
 	}
 
 	// Update global state
+	logDebug("BEGIN: Updating global state")
 	dockerContainerID = containerID
 	dockerHostPort = hostPort
 	dockerRunning = true
@@ -1391,44 +1423,63 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	dockerStdin = stdin
 
 	// Update mcpServerAddr to use the new port
+	oldServerAddr := mcpServerAddr
 	mcpServerAddr = fmt.Sprintf("http://localhost:%s", hostPort)
+	logDebug("BEGIN: Updated server address from %s to %s", oldServerAddr, mcpServerAddr)
 
 	// Start goroutine to handle ping/pong communication
+	logDebug("BEGIN: Starting Docker keepalive handler goroutine")
 	go handleDockerKeepalive(stdout, stdin)
 
 	logInfo("Docker container ready. Host port: %s, Container ID: %s", hostPort, containerID)
+	logDebug("BEGIN: Workspace setup completed successfully")
 
 	return mcp.NewToolResultText(fmt.Sprintf("Workspace started successfully!\nWorkspace ID: %s\nHost Port: %s\nServer URL: %s", containerID, hostPort, mcpServerAddr)), nil
 }
 
 func saveWorkToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	logDebug("SAVE_WORK: Starting save_work tool handler")
 	dockerMutex.Lock()
 	defer dockerMutex.Unlock()
 	
 	// Check if container is running
 	if !dockerRunning || dockerContainerID == "" {
+		logDebug("SAVE_WORK: No workspace running (dockerRunning=%t, containerID='%s')", dockerRunning, dockerContainerID)
 		return mcp.NewToolResultError("No workspace is running. Please call 'begin' tool first."), nil
 	}
 
+	logDebug("SAVE_WORK: Workspace is running, container ID: %s", dockerContainerID)
+
 	comment, err := request.RequireString("comment")
 	if err != nil {
+		logDebug("SAVE_WORK: Failed to get comment parameter: %v", err)
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
+	logDebug("SAVE_WORK: Commit comment: '%s'", comment)
+
 	// Commit the container
 	logInfo("Committing Docker container %s with message: %s", dockerContainerID, comment)
+	logDebug("SAVE_WORK: Creating docker commit command")
 	commitCmd := exec.Command("docker", "commit", "-m", comment, dockerContainerID)
+	logDebug("SAVE_WORK: Docker commit command: %v", commitCmd.Args)
+	
+	logDebug("SAVE_WORK: Executing docker commit")
 	output, err := commitCmd.Output()
 	if err != nil {
+		logDebug("SAVE_WORK: Docker commit failed: %v", err)
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to commit Docker container: %v", err)), nil
 	}
 
+	logDebug("SAVE_WORK: Docker commit output: '%s'", string(output))
 	imageID := strings.TrimSpace(string(output))
 	if imageID == "" {
+		logDebug("SAVE_WORK: Docker commit returned empty image ID")
 		return mcp.NewToolResultError("Docker commit command returned empty image ID"), nil
 	}
 
 	logInfo("Docker container committed successfully. New image ID: %s", imageID)
+	logDebug("SAVE_WORK: Successfully committed container, new image ID: %s", imageID)
 
 	return mcp.NewToolResultText(fmt.Sprintf("Work saved successfully!\nNew Image ID: %s\nCommit Message: %s\nWorkspace ID: %s", imageID, comment, dockerContainerID)), nil
 }
