@@ -1485,7 +1485,7 @@ func saveWorkToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 	logInfo("Docker container committed successfully. New image ID: %s", imageID)
 	logDebug("SAVE_WORK: Successfully committed container, new image ID: %s", imageID)
 
-	return mcp.NewToolResultText(fmt.Sprintf("Work saved successfully!\nNew Image ID: %s\nCommit Message: %s\nWorkspace ID: %s", imageID, comment, dockerContainerID)), nil
+	return mcp.NewToolResultText(fmt.Sprintf("Work saved, New Workspace Id: %s", imageID)), nil
 }
 
 func cleanupDockerContainer() {
