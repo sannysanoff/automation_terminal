@@ -1482,6 +1482,11 @@ func saveWorkToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 		return mcp.NewToolResultError("Docker commit command returned empty image ID"), nil
 	}
 
+	// Remove "sha256:" prefix if present
+	if strings.HasPrefix(imageID, "sha256:") {
+		imageID = strings.TrimPrefix(imageID, "sha256:")
+	}
+
 	logInfo("Docker container committed successfully. New image ID: %s", imageID)
 	logDebug("SAVE_WORK: Successfully committed container, new image ID: %s", imageID)
 
