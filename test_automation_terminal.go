@@ -1472,7 +1472,7 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	logInfo("Docker container ready. Host port: %s, Container ID: %s", hostPort, containerID)
 	logDebug("BEGIN: Workspace setup completed successfully")
 
-	return mcp.NewToolResultText(fmt.Sprintf("Workspace started successfully!\nWorkspace ID: %s\nHost Port: %s\nServer URL: %s", containerID, hostPort, mcpServerAddr)), nil
+	return mcp.NewToolResultText("Workspace started successfully!"), nil
 }
 
 func saveWorkToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
