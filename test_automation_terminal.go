@@ -66,6 +66,8 @@ var (
 	dockerMutex       sync.Mutex
 	dockerCmd         *exec.Cmd
 	dockerStdin       io.WriteCloser
+	dockerDied        chan struct{} // Signal when Docker container dies
+	mcpShutdown       chan struct{} // Signal for graceful MCP shutdown
 
 	// CLI mode configuration
 	cliMode    bool
@@ -1092,6 +1094,26 @@ func main() {
 // --- MCP Server Implementation ---
 
 func runMCPServer() {
+	// Initialize shutdown channels
+	mcpShutdown = make(chan struct{})
+	dockerDied = make(chan struct{})
+
+	// Set up signal handler for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	go func() {
+		sig := <-sigChan
+		logWarn("MCP server received signal: %s. Initiating graceful shutdown.", sig)
+		close(mcpShutdown)
+	}()
+
+	// Monitor for Docker death and exit with error
+	go func() {
+		<-dockerDied
+		logError("Docker container died, exiting MCP server with error code")
+		os.Exit(1)
+	}()
+
 	// Create a new MCP server
 	s := server.NewMCPServer(
 		"Terminal Automation Server 🖥️",
@@ -1157,9 +1179,21 @@ func runMCPServer() {
 	// Set up cleanup for Docker container on exit
 	defer cleanupDockerContainer()
 
-	// Start the stdio server
-	if err := server.ServeStdio(s); err != nil {
-		logError("MCP server error: %v", err)
+	// Start the stdio server in a goroutine
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- server.ServeStdio(s)
+	}()
+
+	// Wait for either server completion or shutdown signal
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			logError("MCP server error: %v", err)
+		}
+	case <-mcpShutdown:
+		logInfo("MCP server shutting down gracefully")
+		// ServeStdio will exit when stdin closes, which happens during cleanup
 	}
 }
 
@@ -1526,6 +1560,17 @@ func cleanupDockerContainer() {
 				<-done // Wait for process to be killed
 			}
 			dockerCmd = nil
+		}
+
+		// Stop the container if it's still running
+		if dockerContainerID != "" {
+			logInfo("Stopping Docker container: %s", dockerContainerID)
+			stopCmd := exec.Command("docker", "stop", dockerContainerID)
+			if err := stopCmd.Run(); err != nil {
+				logWarn("Failed to stop Docker container %s: %v", dockerContainerID, err)
+			} else {
+				logInfo("Docker container %s stopped successfully", dockerContainerID)
+			}
 		}
 
 		dockerRunning = false
@@ -2075,6 +2120,13 @@ func handleDockerKeepalive(stdout io.Reader, stdin io.Writer) {
 	if dockerRunning {
 		logWarn("Docker container communication lost, marking as not running")
 		dockerRunning = false
+		// Signal that Docker died
+		select {
+		case <-dockerDied:
+			// Already closed
+		default:
+			close(dockerDied)
+		}
 	}
 	dockerMutex.Unlock()
 }
