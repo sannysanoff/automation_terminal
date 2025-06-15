@@ -480,7 +480,7 @@ func sendkeysHandler(w http.ResponseWriter, r *http.Request) {
 				}
 				if actualLines == 1 {
 					logInfo("macOS pstree check: Shell PID %d has no children. Command complete.", shellPID)
-					completionMessage = "Command completed (macOS pstree check)."
+					completionMessage = "Command completed."
 					commandCompletedNormally = true
 					break
 				}
@@ -512,7 +512,7 @@ func sendkeysHandler(w http.ResponseWriter, r *http.Request) {
 				logDebug("ps/awk output for children of PID %d: '%s'", shellPID, trimmedOutput)
 				if trimmedOutput == "" {
 					logInfo("Linux ps/awk check: Shell PID %d has no children. Command complete.", shellPID)
-					completionMessage = "Command completed (Linux ps/awk check)."
+					completionMessage = "Command completed."
 					commandCompletedNormally = true
 					break
 				}
