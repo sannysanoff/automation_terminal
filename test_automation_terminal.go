@@ -1935,6 +1935,60 @@ func makeOOBExecRequest(cmd string) (*OOBExecResponse, error) {
 func runKeepaliveMode() {
 	logInfo("Starting keepalive mode - sending ping every 5 seconds, waiting for pong from stdin")
 
+	// Set up PTY and shell first
+	if err := setupPtyAndShell(); err != nil {
+		logError("Failed to setup PTY and shell in keepalive mode: %v", err)
+		os.Exit(1)
+	}
+
+	// Defer cleanup to ensure it runs on exit
+	defer cleanup()
+
+	// Start PTY reader goroutine
+	go ptyReader()
+
+	// Give shell and pty_reader a moment to initialize
+	logInfo("Waiting a moment for PTY to initialize...")
+	time.Sleep(500 * time.Millisecond)
+
+	// Set up signal handler for termination signals
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	go func() {
+		sig := <-sigChan
+		logWarn("Received signal: %s. Initiating shutdown sequence.", sig)
+		os.Exit(0) // Trigger deferred cleanup
+	}()
+
+	// Setup HTTP server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/sendkeys_nowait", sendkeysNowaitHandler)
+	mux.HandleFunc("/sendkeys", sendkeysHandler)
+	mux.HandleFunc("/screen", screenHandler)
+	mux.HandleFunc("/oob_exec", oobExecHandler)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			logWarn("Invalid URL accessed: %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprintln(w, "PTY Automation Server running in keepalive mode. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /oob_exec")
+	})
+
+	// Start HTTP server in background
+	httpServerAddr := ":5399"
+	server := &http.Server{
+		Addr:    httpServerAddr,
+		Handler: mux,
+	}
+	
+	go func() {
+		logInfo("Starting HTTP server on %s in keepalive mode", httpServerAddr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logError("HTTP server ListenAndServe error in keepalive mode: %v", err)
+		}
+	}()
+
 	// Channel to receive pong responses from stdin
 	pongChan := make(chan bool, 1)
 
@@ -1953,6 +2007,7 @@ func runKeepaliveMode() {
 		}
 		// If stdin closes, exit
 		logInfo("Stdin closed, exiting keepalive mode")
+		server.Shutdown(context.Background())
 		os.Exit(0)
 	}()
 
@@ -1977,6 +2032,7 @@ func runKeepaliveMode() {
 
 				if missedPongs >= 3 {
 					logError("Three pings passed without pong response, terminating")
+					server.Shutdown(context.Background())
 					os.Exit(1)
 				}
 			}
