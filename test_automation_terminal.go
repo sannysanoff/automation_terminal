@@ -57,6 +57,12 @@ var (
 	mcpMode       bool
 	mcpServerAddr string = "http://localhost:5399" // Default server address for MCP client calls
 	
+	// Docker container management for MCP mode
+	dockerContainerID string
+	dockerHostPort    string
+	dockerRunning     bool
+	dockerMutex       sync.Mutex
+	
 	// CLI mode configuration
 	cliMode    bool
 	cliHost    string = "localhost"
@@ -1086,6 +1092,28 @@ func runMCPServer() {
 	)
 	s.AddTool(oobExecTool, oobExecToolHandler)
 
+	// Add begin tool
+	beginTool := mcp.NewTool("begin",
+		mcp.WithDescription("Start a Docker container with automation terminal. Must be called before using other terminal tools."),
+		mcp.WithString("image_id",
+			mcp.Description("Optional Docker image ID/name (default: sannysanoff/automation_terminal)"),
+		),
+	)
+	s.AddTool(beginTool, beginToolHandler)
+
+	// Add save_work tool
+	saveWorkTool := mcp.NewTool("save_work",
+		mcp.WithDescription("Commit current Docker container state to a new image. Requires 'begin' to be called first."),
+		mcp.WithString("comment",
+			mcp.Required(),
+			mcp.Description("Commit message describing the work done"),
+		),
+	)
+	s.AddTool(saveWorkTool, saveWorkToolHandler)
+
+	// Set up cleanup for Docker container on exit
+	defer cleanupDockerContainer()
+
 	// Start the stdio server
 	if err := server.ServeStdio(s); err != nil {
 		logError("MCP server error: %v", err)
@@ -1093,6 +1121,15 @@ func runMCPServer() {
 }
 
 func sendkeysNowaitToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Check if Docker container is running
+	dockerMutex.Lock()
+	running := dockerRunning
+	dockerMutex.Unlock()
+	
+	if !running {
+		return mcp.NewToolResultError("Docker container not running. Please call 'begin' tool first."), nil
+	}
+
 	keys, err := request.RequireString("keys")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -1112,6 +1149,15 @@ func sendkeysNowaitToolHandler(ctx context.Context, request mcp.CallToolRequest)
 }
 
 func sendkeysToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Check if Docker container is running
+	dockerMutex.Lock()
+	running := dockerRunning
+	dockerMutex.Unlock()
+	
+	if !running {
+		return mcp.NewToolResultError("Docker container not running. Please call 'begin' tool first."), nil
+	}
+
 	keys, err := request.RequireString("keys")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -1139,6 +1185,15 @@ func sendkeysToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 }
 
 func screenToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Check if Docker container is running
+	dockerMutex.Lock()
+	running := dockerRunning
+	dockerMutex.Unlock()
+	
+	if !running {
+		return mcp.NewToolResultError("Docker container not running. Please call 'begin' tool first."), nil
+	}
+
 	// Make REST call to /screen endpoint
 	resp, err := makeScreenRequest()
 	if err != nil {
@@ -1160,6 +1215,15 @@ func screenToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.C
 }
 
 func oobExecToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Check if Docker container is running
+	dockerMutex.Lock()
+	running := dockerRunning
+	dockerMutex.Unlock()
+	
+	if !running {
+		return mcp.NewToolResultError("Docker container not running. Please call 'begin' tool first."), nil
+	}
+
 	cmd, err := request.RequireString("cmd")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -1188,13 +1252,137 @@ func oobExecToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.
 	return mcp.NewToolResultText(result), nil
 }
 
+func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	dockerMutex.Lock()
+	defer dockerMutex.Unlock()
+	
+	// Check if container is already running
+	if dockerRunning {
+		return mcp.NewToolResultError("Docker container is already running. Use 'save_work' to commit changes or stop the current container first."), nil
+	}
+
+	// Get image ID (optional parameter)
+	imageID := "sannysanoff/automation_terminal"
+	if id, err := request.RequireString("image_id"); err == nil && id != "" {
+		imageID = id
+	}
+
+	// Run Docker container
+	logInfo("Starting Docker container with image: %s", imageID)
+	cmd := exec.Command("docker", "run", "-d", "--rm", "-it", "-p", ":5399", imageID)
+	output, err := cmd.Output()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to start Docker container: %v", err)), nil
+	}
+
+	containerID := strings.TrimSpace(string(output))
+	if containerID == "" {
+		return mcp.NewToolResultError("Docker run command returned empty container ID"), nil
+	}
+
+	logInfo("Docker container started with ID: %s", containerID)
+
+	// Wait a moment for container to start
+	time.Sleep(2 * time.Second)
+
+	// Get port mapping
+	inspectCmd := exec.Command("docker", "inspect", "--format={{json .NetworkSettings.Ports}}", containerID)
+	portOutput, err := inspectCmd.Output()
+	if err != nil {
+		// Clean up container on failure
+		exec.Command("docker", "stop", containerID).Run()
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to inspect Docker container ports: %v", err)), nil
+	}
+
+	// Parse port mapping JSON
+	var ports map[string][]map[string]string
+	if err := json.Unmarshal(portOutput, &ports); err != nil {
+		exec.Command("docker", "stop", containerID).Run()
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to parse port mapping JSON: %v", err)), nil
+	}
+
+	// Extract host port for 5399/tcp
+	hostPort := ""
+	if tcpPorts, exists := ports["5399/tcp"]; exists && len(tcpPorts) > 0 {
+		hostPort = tcpPorts[0]["HostPort"]
+	}
+
+	if hostPort == "" {
+		exec.Command("docker", "stop", containerID).Run()
+		return mcp.NewToolResultError("Failed to find host port mapping for 5399/tcp"), nil
+	}
+
+	// Update global state
+	dockerContainerID = containerID
+	dockerHostPort = hostPort
+	dockerRunning = true
+
+	// Update mcpServerAddr to use the new port
+	mcpServerAddr = fmt.Sprintf("http://localhost:%s", hostPort)
+
+	logInfo("Docker container ready. Host port: %s, Container ID: %s", hostPort, containerID)
+
+	return mcp.NewToolResultText(fmt.Sprintf("Docker container started successfully!\nContainer ID: %s\nHost Port: %s\nServer URL: %s", containerID, hostPort, mcpServerAddr)), nil
+}
+
+func saveWorkToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	dockerMutex.Lock()
+	defer dockerMutex.Unlock()
+	
+	// Check if container is running
+	if !dockerRunning || dockerContainerID == "" {
+		return mcp.NewToolResultError("No Docker container is running. Please call 'begin' tool first."), nil
+	}
+
+	comment, err := request.RequireString("comment")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Commit the container
+	logInfo("Committing Docker container %s with message: %s", dockerContainerID, comment)
+	commitCmd := exec.Command("docker", "commit", "-m", comment, dockerContainerID)
+	output, err := commitCmd.Output()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to commit Docker container: %v", err)), nil
+	}
+
+	imageID := strings.TrimSpace(string(output))
+	if imageID == "" {
+		return mcp.NewToolResultError("Docker commit command returned empty image ID"), nil
+	}
+
+	logInfo("Docker container committed successfully. New image ID: %s", imageID)
+
+	return mcp.NewToolResultText(fmt.Sprintf("Work saved successfully!\nNew Image ID: %s\nCommit Message: %s\nContainer ID: %s", imageID, comment, dockerContainerID)), nil
+}
+
+func cleanupDockerContainer() {
+	dockerMutex.Lock()
+	defer dockerMutex.Unlock()
+	
+	if dockerRunning && dockerContainerID != "" {
+		logInfo("Cleaning up Docker container: %s", dockerContainerID)
+		cmd := exec.Command("docker", "stop", dockerContainerID)
+		if err := cmd.Run(); err != nil {
+			logWarn("Failed to stop Docker container %s: %v", dockerContainerID, err)
+		} else {
+			logInfo("Docker container %s stopped successfully", dockerContainerID)
+		}
+		dockerRunning = false
+		dockerContainerID = ""
+		dockerHostPort = ""
+	}
+}
+
 // --- REST Client Functions for MCP Tools ---
 
 func makeSendkeysNowaitRequest(keys string) (*SendkeysNowaitResponse, error) {
 	data := url.Values{}
 	data.Set("keys", keys)
 
-	resp, err := http.PostForm(mcpServerAddr+"/sendkeys_nowait", data)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.PostForm(mcpServerAddr+"/sendkeys_nowait", data)
 	if err != nil {
 		return nil, err
 	}
@@ -1538,7 +1726,8 @@ func makeSendkeysRequest(keys string) (*SendkeysResponse, error) {
 	data := url.Values{}
 	data.Set("keys", keys)
 
-	resp, err := http.PostForm(mcpServerAddr+"/sendkeys", data)
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.PostForm(mcpServerAddr+"/sendkeys", data)
 	if err != nil {
 		return nil, err
 	}
@@ -1553,7 +1742,8 @@ func makeSendkeysRequest(keys string) (*SendkeysResponse, error) {
 }
 
 func makeScreenRequest() (*ScreenResponse, error) {
-	resp, err := http.Get(mcpServerAddr + "/screen")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(mcpServerAddr + "/screen")
 	if err != nil {
 		return nil, err
 	}
@@ -1571,7 +1761,8 @@ func makeOOBExecRequest(cmd string) (*OOBExecResponse, error) {
 	data := url.Values{}
 	data.Set("cmd", cmd)
 
-	resp, err := http.PostForm(mcpServerAddr+"/oob_exec", data)
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.PostForm(mcpServerAddr+"/oob_exec", data)
 	if err != nil {
 		return nil, err
 	}
