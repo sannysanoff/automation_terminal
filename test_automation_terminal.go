@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -70,6 +71,9 @@ var (
 	cliCommand string
 	cliArgs    []string
 	outputJSON bool
+	
+	// Keepalive mode configuration
+	keepaliveMode bool
 )
 
 // --- Structs for HTTP responses ---
@@ -944,6 +948,7 @@ func main() {
 	host := flag.String("host", "localhost", "Server host for CLI mode.")
 	port := flag.Int("port", 5399, "Server port for CLI mode.")
 	jsonOutput := flag.Bool("json", false, "Output raw JSON response in CLI mode.")
+	keepalive := flag.Bool("keepalive", false, "Run in keepalive mode - send ping every 5 seconds, wait for pong from stdin.")
 	flag.Parse()
 
 	verboseLoggingEnabled = *verbose
@@ -953,6 +958,7 @@ func main() {
 	cliHost = *host
 	cliPort = *port
 	outputJSON = *jsonOutput
+	keepaliveMode = *keepalive
 
 	if cliMode {
 		args := flag.Args()
@@ -963,6 +969,11 @@ func main() {
 		cliCommand = args[0]
 		cliArgs = args[1:]
 		runCLIClient()
+		return
+	}
+
+	if keepaliveMode {
+		runKeepaliveMode()
 		return
 	}
 
@@ -1774,4 +1785,58 @@ func makeOOBExecRequest(cmd string) (*OOBExecResponse, error) {
 	}
 
 	return &result, nil
+}
+
+// --- Keepalive Mode Implementation ---
+
+func runKeepaliveMode() {
+	logInfo("Starting keepalive mode - sending ping every 5 seconds, waiting for pong from stdin")
+	
+	// Channel to receive pong responses from stdin
+	pongChan := make(chan bool, 1)
+	
+	// Start stdin reader goroutine
+	go func() {
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "pong" {
+				select {
+				case pongChan <- true:
+				default:
+					// Channel full, ignore
+				}
+			}
+		}
+		// If stdin closes, exit
+		logInfo("Stdin closed, exiting keepalive mode")
+		os.Exit(0)
+	}()
+	
+	missedPongs := 0
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ticker.C:
+			// Send ping
+			fmt.Println("ping")
+			
+			// Wait up to 5 seconds for pong
+			select {
+			case <-pongChan:
+				logInfo("Received pong, resetting missed count")
+				missedPongs = 0
+			case <-time.After(5 * time.Second):
+				missedPongs++
+				logWarn("Missed pong #%d", missedPongs)
+				
+				if missedPongs >= 3 {
+					logError("Three pings passed without pong response, terminating")
+					os.Exit(1)
+				}
+			}
+		}
+	}
 }
