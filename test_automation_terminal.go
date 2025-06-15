@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -8,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -21,6 +24,8 @@ import (
 
 	"github.com/Azure/go-ansiterm"
 	"github.com/creack/pty"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 	"golang.org/x/sys/unix"
 	// "unicode" // Moved to event_handler.go if still needed there for IsPrint
 )
@@ -48,6 +53,10 @@ var (
 	maxSyncWaitSeconds    int = 60 // Maximum wait time for synchronous keystroke command completion
 	defaultPtyCols        int = 80 // Changed to int for easier use with TermEventHandler
 	defaultPtyLines       int = 25 // Changed to int
+
+	// MCP mode configuration
+	mcpMode       bool
+	mcpServerAddr string = "http://localhost:5399" // Default server address for MCP client calls
 )
 
 // --- Structs for HTTP responses ---
@@ -916,14 +925,25 @@ func cleanup() {
 // --- Main Application ---
 func main() {
 	verbose := flag.Bool("verbose", false, "Enable verbose logging of PTY stream processing.")
+	mcp := flag.Bool("mcp", false, "Run as MCP server instead of HTTP server.")
+	serverAddr := flag.String("server", "http://localhost:5399", "Server address for MCP client REST calls.")
 	flag.Parse()
 
 	verboseLoggingEnabled = *verbose
+	mcpMode = *mcp
+	mcpServerAddr = *serverAddr
+
 	if verboseLoggingEnabled {
 		log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 		logInfo("Verbose logging enabled.")
 	} else {
 		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	}
+
+	if mcpMode {
+		logInfo("Starting in MCP server mode, server address: %s", mcpServerAddr)
+		runMCPServer()
+		return
 	}
 
 	if err := setupPtyAndShell(); err != nil {
@@ -991,4 +1011,223 @@ func main() {
 		// Cleanup will be called by defer
 	}
 	logInfo("HTTP server shut down.")
+}
+
+// --- MCP Server Implementation ---
+
+func runMCPServer() {
+	// Create a new MCP server
+	s := server.NewMCPServer(
+		"Terminal Automation Server 🖥️",
+		"1.0.0",
+		server.WithToolCapabilities(false),
+	)
+
+	// Add keystroke tool
+	keystrokeTool := mcp.NewTool("keystroke",
+		mcp.WithDescription("Send keystrokes to terminal"),
+		mcp.WithString("keys",
+			mcp.Required(),
+			mcp.Description("Keys to send to the terminal"),
+		),
+	)
+	s.AddTool(keystrokeTool, keystrokeToolHandler)
+
+	// Add keystroke_sync tool
+	keystrokeSyncTool := mcp.NewTool("keystroke_sync",
+		mcp.WithDescription("Send keystrokes to terminal and wait for command completion"),
+		mcp.WithString("keys",
+			mcp.Required(),
+			mcp.Description("Keys to send to the terminal"),
+		),
+	)
+	s.AddTool(keystrokeSyncTool, keystrokeSyncToolHandler)
+
+	// Add screen tool
+	screenTool := mcp.NewTool("screen",
+		mcp.WithDescription("Get current terminal screen content"),
+	)
+	s.AddTool(screenTool, screenToolHandler)
+
+	// Add oob_exec tool
+	oobExecTool := mcp.NewTool("oob_exec",
+		mcp.WithDescription("Execute command out-of-band (not through terminal)"),
+		mcp.WithString("cmd",
+			mcp.Required(),
+			mcp.Description("Command to execute"),
+		),
+	)
+	s.AddTool(oobExecTool, oobExecToolHandler)
+
+	// Start the stdio server
+	if err := server.ServeStdio(s); err != nil {
+		logError("MCP server error: %v", err)
+	}
+}
+
+func keystrokeToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	keys, err := request.RequireString("keys")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Make REST call to /keystroke endpoint
+	resp, err := makeKeystrokeRequest(keys)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to send keystroke: %v", err)), nil
+	}
+
+	if resp.Error != "" {
+		return mcp.NewToolResultError(resp.Error), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Successfully sent keys: %s", resp.KeysSent)), nil
+}
+
+func keystrokeSyncToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	keys, err := request.RequireString("keys")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Make REST call to /keystroke_sync endpoint
+	resp, err := makeKeystrokeSyncRequest(keys)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to send synchronous keystroke: %v", err)), nil
+	}
+
+	if resp.Error != "" {
+		return mcp.NewToolResultError(resp.Error), nil
+	}
+
+	result := fmt.Sprintf("Status: %s\nMessage: %s", resp.Status, resp.Message)
+	if resp.Output != "" {
+		result += fmt.Sprintf("\nOutput:\n%s", resp.Output)
+	}
+	if resp.Timeout {
+		result += "\nTimeout: true"
+	}
+
+	return mcp.NewToolResultText(result), nil
+}
+
+func screenToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Make REST call to /screen endpoint
+	resp, err := makeScreenRequest()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to get screen: %v", err)), nil
+	}
+
+	if resp.Error != "" {
+		return mcp.NewToolResultError(resp.Error), nil
+	}
+
+	result := fmt.Sprintf("Cursor: X=%d, Y=%d, Hidden=%t\n\nScreen Content:\n", 
+		resp.Cursor.X, resp.Cursor.Y, resp.Cursor.Hidden)
+	
+	for i, line := range resp.Screen {
+		result += fmt.Sprintf("%2d: %s\n", i+1, line)
+	}
+
+	return mcp.NewToolResultText(result), nil
+}
+
+func oobExecToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	cmd, err := request.RequireString("cmd")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Make REST call to /oob_exec endpoint
+	resp, err := makeOOBExecRequest(cmd)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to execute command: %v", err)), nil
+	}
+
+	result := fmt.Sprintf("Exit Code: %d", resp.ExitCode)
+	if resp.Stdout != "" {
+		result += fmt.Sprintf("\nStdout:\n%s", resp.Stdout)
+	}
+	if resp.Stderr != "" {
+		result += fmt.Sprintf("\nStderr:\n%s", resp.Stderr)
+	}
+	if resp.Error != "" {
+		result += fmt.Sprintf("\nError: %s", resp.Error)
+	}
+	if resp.Timeout {
+		result += "\nTimeout: true"
+	}
+
+	return mcp.NewToolResultText(result), nil
+}
+
+// --- REST Client Functions for MCP Tools ---
+
+func makeKeystrokeRequest(keys string) (*KeystrokeResponse, error) {
+	data := url.Values{}
+	data.Set("keys", keys)
+
+	resp, err := http.PostForm(mcpServerAddr+"/keystroke", data)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result KeystrokeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func makeKeystrokeSyncRequest(keys string) (*KeystrokeSyncResponse, error) {
+	data := url.Values{}
+	data.Set("keys", keys)
+
+	resp, err := http.PostForm(mcpServerAddr+"/keystroke_sync", data)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result KeystrokeSyncResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func makeScreenRequest() (*ScreenResponse, error) {
+	resp, err := http.Get(mcpServerAddr + "/screen")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result ScreenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+func makeOOBExecRequest(cmd string) (*OOBExecResponse, error) {
+	data := url.Values{}
+	data.Set("cmd", cmd)
+
+	resp, err := http.PostForm(mcpServerAddr+"/oob_exec", data)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result OOBExecResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
 }
