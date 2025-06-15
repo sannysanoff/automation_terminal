@@ -1521,6 +1521,11 @@ func saveWorkToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 		imageID = strings.TrimPrefix(imageID, "sha256:")
 	}
 
+	// Shorten hash to first 12 characters
+	if len(imageID) > 12 {
+		imageID = imageID[:12]
+	}
+
 	logInfo("Docker container committed successfully. New image ID: %s", imageID)
 	logDebug("SAVE_WORK: Successfully committed container, new image ID: %s", imageID)
 
