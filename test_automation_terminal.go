@@ -975,8 +975,8 @@ func main() {
 
 	// Setup and run Flask-like HTTP server
 	mux := http.NewServeMux()
-	mux.HandleFunc("/keystroke", keystrokeHandler)
-	mux.HandleFunc("/keystroke_sync", keystrokeSyncHandler)
+	mux.HandleFunc("/sendkeys_nowait", sendkeysNowaitHandler)
+	mux.HandleFunc("/sendkeys", sendkeysHandler)
 	mux.HandleFunc("/screen", screenHandler)
 	mux.HandleFunc("/oob_exec", oobExecHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
