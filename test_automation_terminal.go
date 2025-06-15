@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -999,14 +998,14 @@ func main() {
 		}
 	}
 
-	serverAddr := ":5399"
-	logInfo("Starting HTTP server on %s", serverAddr)
+	httpServerAddr := ":5399"
+	logInfo("Starting HTTP server on %s", httpServerAddr)
 	logInfo("Endpoints:")
 	logInfo("  POST /sendkeys_nowait (form data: {'keys': 'your_command\\n'})")
 	logInfo("  POST /sendkeys (form data: {'keys': 'your_command\\n'})")
 	logInfo("  GET  /screen")
 
-	if err := http.ListenAndServe(serverAddr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := http.ListenAndServe(httpServerAddr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logError("HTTP server ListenAndServe error: %v", err)
 		// Cleanup will be called by defer
 	}
