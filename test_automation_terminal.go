@@ -60,13 +60,13 @@ var (
 )
 
 // --- Structs for HTTP responses ---
-type KeystrokeResponse struct {
+type SendkeysNowaitResponse struct {
 	Status   string `json:"status"`
 	KeysSent string `json:"keys_sent,omitempty"`
 	Error    string `json:"error,omitempty"`
 }
 
-type KeystrokeSyncResponse struct {
+type SendkeysResponse struct {
 	Status  string `json:"status"`
 	Message string `json:"message"`
 	Output  string `json:"output,omitempty"`
@@ -302,8 +302,8 @@ type OOBExecResponse struct {
 }
 
 // --- HTTP Handlers ---
-func keystrokeHandler(w http.ResponseWriter, r *http.Request) {
-	logInfo("Received POST /keystroke. Form data: %v", r.Form)
+func sendkeysNowaitHandler(w http.ResponseWriter, r *http.Request) {
+	logInfo("Received POST /sendkeys_nowait. Form data: %v", r.Form)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, `{"error": "Failed to parse form data"}`, http.StatusBadRequest)
 		return
@@ -319,9 +319,9 @@ func keystrokeHandler(w http.ResponseWriter, r *http.Request) {
 	ptyRunningMu.Unlock()
 
 	if ptyMaster == nil || !active {
-		logWarn("PTY not active for /keystroke")
+		logWarn("PTY not active for /sendkeys_nowait")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(KeystrokeResponse{Error: "PTY not active or not initialized"})
+		json.NewEncoder(w).Encode(SendkeysNowaitResponse{Error: "PTY not active or not initialized"})
 		return
 	}
 
@@ -329,16 +329,16 @@ func keystrokeHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		logError("Error writing to PTY: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(KeystrokeResponse{Error: fmt.Sprintf("Error writing to PTY: %v", err)})
+		json.NewEncoder(w).Encode(SendkeysNowaitResponse{Error: fmt.Sprintf("Error writing to PTY: %v", err)})
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(KeystrokeResponse{Status: "success", KeysSent: keys})
+	json.NewEncoder(w).Encode(SendkeysNowaitResponse{Status: "success", KeysSent: keys})
 }
 
-func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
-	logInfo("Received POST /keystroke_sync. Form data: %v", r.Form)
+func sendkeysHandler(w http.ResponseWriter, r *http.Request) {
+	logInfo("Received POST /sendkeys. Form data: %v", r.Form)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, `{"error": "Failed to parse form data"}`, http.StatusBadRequest)
 		return
@@ -354,15 +354,15 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 	ptyRunningMu.Unlock()
 
 	if ptyMaster == nil || !active || ptySlaveForTcgetpgrp == nil {
-		logWarn("PTY not active for /keystroke_sync")
+		logWarn("PTY not active for /sendkeys")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(KeystrokeSyncResponse{Status: "error", Message: "PTY not active or not initialized"})
+		json.NewEncoder(w).Encode(SendkeysResponse{Status: "error", Message: "PTY not active or not initialized"})
 		return
 	}
 	if shellCmd == nil || shellCmd.Process == nil || shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
-		logWarn("Shell process not running for /keystroke_sync")
+		logWarn("Shell process not running for /sendkeys")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(KeystrokeSyncResponse{Status: "error", Message: "Shell process is not running."})
+		json.NewEncoder(w).Encode(SendkeysResponse{Status: "error", Message: "Shell process is not running."})
 		return
 	}
 
@@ -377,7 +377,7 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		logError("Error writing to PTY for sync: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(KeystrokeSyncResponse{Status: "error", Message: fmt.Sprintf("Error writing to PTY: %v", err)})
+		json.NewEncoder(w).Encode(SendkeysResponse{Status: "error", Message: fmt.Sprintf("Error writing to PTY: %v", err)})
 		return
 	}
 	logInfo("Sent keys for sync: '%s'", strings.TrimSpace(keys))
@@ -399,7 +399,7 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(
-			KeystrokeSyncResponse{
+			SendkeysResponse{
 				Status:  "success",
 				Message: "Shell process exited shortly after command submission.",
 				Output:  joined,
@@ -413,7 +413,7 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		logError("Failed to get PGID for shell PID %d: %v", shellPID, err)
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(KeystrokeSyncResponse{Status: "error", Message: fmt.Sprintf("Failed to get shell PGID: %v", err)})
+		json.NewEncoder(w).Encode(SendkeysResponse{Status: "error", Message: fmt.Sprintf("Failed to get shell PGID: %v", err)})
 		return
 	}
 	// --- Timeout/kill logic additions ---
@@ -737,7 +737,7 @@ func keystrokeSyncHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(httpStatusCode)
 	json.NewEncoder(w).Encode(
-		KeystrokeSyncResponse{Status: status, Message: completionMessage, Output: joined, Timeout: timeoutHappened},
+		SendkeysResponse{Status: status, Message: completionMessage, Output: joined, Timeout: timeoutHappened},
 	)
 }
 
@@ -986,7 +986,7 @@ func main() {
 			return
 		}
 		// Could serve a simple help page or redirect
-		fmt.Fprintln(w, "PTY Automation Server running. Endpoints: /keystroke, /keystroke_sync, /screen, /oob_exec")
+		fmt.Fprintln(w, "PTY Automation Server running. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /oob_exec")
 	})
 
 	// Attempt to set host TTY to a sane state
@@ -1002,8 +1002,8 @@ func main() {
 	serverAddr := ":5399"
 	logInfo("Starting HTTP server on %s", serverAddr)
 	logInfo("Endpoints:")
-	logInfo("  POST /keystroke (form data: {'keys': 'your_command\\n'})")
-	logInfo("  POST /keystroke_sync (form data: {'keys': 'your_command\\n'})")
+	logInfo("  POST /sendkeys_nowait (form data: {'keys': 'your_command\\n'})")
+	logInfo("  POST /sendkeys (form data: {'keys': 'your_command\\n'})")
 	logInfo("  GET  /screen")
 
 	if err := http.ListenAndServe(serverAddr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -1023,25 +1023,25 @@ func runMCPServer() {
 		server.WithToolCapabilities(false),
 	)
 
-	// Add keystroke tool
-	keystrokeTool := mcp.NewTool("keystroke",
+	// Add sendkeys_nowait tool
+	sendkeysNowaitTool := mcp.NewTool("sendkeys_nowait",
 		mcp.WithDescription("Send keystrokes to terminal"),
 		mcp.WithString("keys",
 			mcp.Required(),
 			mcp.Description("Keys to send to the terminal"),
 		),
 	)
-	s.AddTool(keystrokeTool, keystrokeToolHandler)
+	s.AddTool(sendkeysNowaitTool, sendkeysNowaitToolHandler)
 
-	// Add keystroke_sync tool
-	keystrokeSyncTool := mcp.NewTool("keystroke_sync",
+	// Add sendkeys tool
+	sendkeysTool := mcp.NewTool("sendkeys",
 		mcp.WithDescription("Send keystrokes to terminal and wait for command completion"),
 		mcp.WithString("keys",
 			mcp.Required(),
 			mcp.Description("Keys to send to the terminal"),
 		),
 	)
-	s.AddTool(keystrokeSyncTool, keystrokeSyncToolHandler)
+	s.AddTool(sendkeysTool, sendkeysToolHandler)
 
 	// Add screen tool
 	screenTool := mcp.NewTool("screen",
@@ -1065,14 +1065,14 @@ func runMCPServer() {
 	}
 }
 
-func keystrokeToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func sendkeysNowaitToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	keys, err := request.RequireString("keys")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// Make REST call to /keystroke endpoint
-	resp, err := makeKeystrokeRequest(keys)
+	// Make REST call to /sendkeys_nowait endpoint
+	resp, err := makeSendkeysNowaitRequest(keys)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to send keystroke: %v", err)), nil
 	}
@@ -1084,14 +1084,14 @@ func keystrokeToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mc
 	return mcp.NewToolResultText(fmt.Sprintf("Successfully sent keys: %s", resp.KeysSent)), nil
 }
 
-func keystrokeSyncToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func sendkeysToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	keys, err := request.RequireString("keys")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// Make REST call to /keystroke_sync endpoint
-	resp, err := makeKeystrokeSyncRequest(keys)
+	// Make REST call to /sendkeys endpoint
+	resp, err := makeSendkeysRequest(keys)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to send synchronous keystroke: %v", err)), nil
 	}
@@ -1163,17 +1163,17 @@ func oobExecToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.
 
 // --- REST Client Functions for MCP Tools ---
 
-func makeKeystrokeRequest(keys string) (*KeystrokeResponse, error) {
+func makeSendkeysNowaitRequest(keys string) (*SendkeysNowaitResponse, error) {
 	data := url.Values{}
 	data.Set("keys", keys)
 
-	resp, err := http.PostForm(mcpServerAddr+"/keystroke", data)
+	resp, err := http.PostForm(mcpServerAddr+"/sendkeys_nowait", data)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	var result KeystrokeResponse
+	var result SendkeysNowaitResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
@@ -1181,17 +1181,17 @@ func makeKeystrokeRequest(keys string) (*KeystrokeResponse, error) {
 	return &result, nil
 }
 
-func makeKeystrokeSyncRequest(keys string) (*KeystrokeSyncResponse, error) {
+func makeSendkeysRequest(keys string) (*SendkeysResponse, error) {
 	data := url.Values{}
 	data.Set("keys", keys)
 
-	resp, err := http.PostForm(mcpServerAddr+"/keystroke_sync", data)
+	resp, err := http.PostForm(mcpServerAddr+"/sendkeys", data)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	var result KeystrokeSyncResponse
+	var result SendkeysResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}

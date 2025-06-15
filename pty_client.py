@@ -19,9 +19,9 @@ class PTYClient:
         self.base_url = f"http://{host}:{port}"
         self.session = requests.Session()
     
-    def keystroke(self, keys: str) -> Dict[str, Any]:
+    def sendkeys_nowait(self, keys: str) -> Dict[str, Any]:
         """Send keystroke to the terminal (async)."""
-        url = f"{self.base_url}/keystroke"
+        url = f"{self.base_url}/sendkeys_nowait"
         data = {"keys": keys}
         
         try:
@@ -31,9 +31,9 @@ class PTYClient:
         except requests.exceptions.RequestException as e:
             return {"error": f"Request failed: {e}"}
     
-    def keystroke_sync(self, keys: str) -> Dict[str, Any]:
+    def sendkeys(self, keys: str) -> Dict[str, Any]:
         """Send keystroke to the terminal and wait for completion (sync)."""
-        url = f"{self.base_url}/keystroke_sync"
+        url = f"{self.base_url}/sendkeys"
         data = {"keys": keys}
         
         try:
@@ -67,8 +67,8 @@ class PTYClient:
             return {"error": f"Request failed: {e}"}
 
 
-def format_keystroke_response(response: Dict[str, Any]) -> str:
-    """Format keystroke response for display."""
+def format_sendkeys_nowait_response(response: Dict[str, Any]) -> str:
+    """Format sendkeys_nowait response for display."""
     if "error" in response:
         return f"❌ Error: {response['error']}"
     
@@ -81,8 +81,8 @@ def format_keystroke_response(response: Dict[str, Any]) -> str:
         return f"⚠️  Status: {status}, Keys: {repr(keys_sent)}"
 
 
-def format_keystroke_sync_response(response: Dict[str, Any]) -> str:
-    """Format keystroke_sync response for display."""
+def format_sendkeys_response(response: Dict[str, Any]) -> str:
+    """Format sendkeys response for display."""
     if "error" in response:
         return f"❌ Error: {response['error']}"
     
@@ -182,8 +182,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s keystroke "ls -la\\n"
-  %(prog)s keystroke-sync "echo 'Hello World'\\n"
+  %(prog)s sendkeys-nowait "ls -la\\n"
+  %(prog)s sendkeys "echo 'Hello World'\\n"
   %(prog)s screen
   %(prog)s oob-exec "ps aux | grep python"
   %(prog)s --host 192.168.1.100 --port 5399 screen
@@ -209,22 +209,22 @@ Examples:
     
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
     
-    # Keystroke command
-    keystroke_parser = subparsers.add_parser(
-        "keystroke", 
+    # Sendkeys nowait command
+    sendkeys_nowait_parser = subparsers.add_parser(
+        "sendkeys-nowait", 
         help="Send keystroke to terminal (async)"
     )
-    keystroke_parser.add_argument(
+    sendkeys_nowait_parser.add_argument(
         "keys", 
         help="Keys to send (use \\n for newline, \\t for tab)"
     )
     
-    # Keystroke sync command
-    keystroke_sync_parser = subparsers.add_parser(
-        "keystroke-sync", 
+    # Sendkeys command
+    sendkeys_parser = subparsers.add_parser(
+        "sendkeys", 
         help="Send keystroke to terminal and wait for completion (sync)"
     )
-    keystroke_sync_parser.add_argument(
+    sendkeys_parser.add_argument(
         "keys", 
         help="Keys to send (use \\n for newline, \\t for tab)"
     )
@@ -256,23 +256,23 @@ Examples:
     
     # Execute command
     try:
-        if args.command == "keystroke":
+        if args.command == "sendkeys-nowait":
             # Process escape sequences
             keys = args.keys.encode().decode('unicode_escape')
-            response = client.keystroke(keys)
+            response = client.sendkeys_nowait(keys)
             if args.json:
                 print(json.dumps(response, indent=2))
             else:
-                print(format_keystroke_response(response))
+                print(format_sendkeys_nowait_response(response))
         
-        elif args.command == "keystroke-sync":
+        elif args.command == "sendkeys":
             # Process escape sequences
             keys = args.keys.encode().decode('unicode_escape')
-            response = client.keystroke_sync(keys)
+            response = client.sendkeys(keys)
             if args.json:
                 print(json.dumps(response, indent=2))
             else:
-                print(format_keystroke_sync_response(response))
+                print(format_sendkeys_response(response))
         
         elif args.command == "screen":
             response = client.get_screen()

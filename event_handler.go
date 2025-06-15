@@ -83,7 +83,7 @@ type TermEventHandler struct {
 	scrollTop    int // 0-indexed
 	scrollBottom int // 0-indexed
 
-	// For /keystroke_sync line capture
+	// For /sendkeys line capture
 	// These mirror the global variables' purpose but are managed by the event handler
 	lineBufferForCapture bytes.Buffer
 	capturedLinesForSync []string
@@ -182,7 +182,7 @@ func (h *TermEventHandler) Print(b byte) error {
 
 	char := rune(b)
 
-	// Line capture logic for /keystroke_sync
+	// Line capture logic for /sendkeys
 	if char == '\n' {
 		// Append current buffer and include the newline
 		line := h.lineBufferForCapture.String()
@@ -699,7 +699,7 @@ func (h *TermEventHandler) GetCursorState() (x, y int, hidden bool) {
 	return h.cursorX, h.cursorY, false
 }
 
-// GetCapturedLinesAndCurrentBuffer returns data for /keystroke_sync
+// GetCapturedLinesAndCurrentBuffer returns data for /sendkeys
 func (h *TermEventHandler) GetCapturedLinesAndCurrentBuffer() ([]string, string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -711,7 +711,7 @@ func (h *TermEventHandler) GetCapturedLinesAndCurrentBuffer() ([]string, string)
 }
 
 // ResetCapturedLinesAndSetBuffer clears captured lines and sets the current line buffer.
-// Used after a /keystroke_sync command.
+// Used after a /sendkeys command.
 func (h *TermEventHandler) ResetCapturedLinesAndSetBuffer(newBufferContent string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
