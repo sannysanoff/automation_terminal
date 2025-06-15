@@ -1437,9 +1437,18 @@ func makeCLISendkeysNowaitRequest(baseURL, keys string) (*SendkeysNowaitResponse
 	}
 	defer resp.Body.Close()
 	
+	// Check HTTP status code
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return &SendkeysNowaitResponse{
+			Error: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)),
+		}, nil
+	}
+	
 	var result SendkeysNowaitResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
 	}
 	
 	return &result, nil
@@ -1456,9 +1465,18 @@ func makeCLISendkeysRequest(baseURL, keys string) (*SendkeysResponse, error) {
 	}
 	defer resp.Body.Close()
 	
+	// Check HTTP status code
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return &SendkeysResponse{
+			Error: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)),
+		}, nil
+	}
+	
 	var result SendkeysResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
 	}
 	
 	return &result, nil
@@ -1471,9 +1489,18 @@ func makeCLIScreenRequest(baseURL string) (*ScreenResponse, error) {
 	}
 	defer resp.Body.Close()
 	
+	// Check HTTP status code
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return &ScreenResponse{
+			Error: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)),
+		}, nil
+	}
+	
 	var result ScreenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
 	}
 	
 	return &result, nil
@@ -1490,9 +1517,18 @@ func makeCLIOOBExecRequest(baseURL, cmd string) (*OOBExecResponse, error) {
 	}
 	defer resp.Body.Close()
 	
+	// Check HTTP status code
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return &OOBExecResponse{
+			Error: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)),
+		}, nil
+	}
+	
 	var result OOBExecResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
 	}
 	
 	return &result, nil
