@@ -56,6 +56,14 @@ var (
 	// MCP mode configuration
 	mcpMode       bool
 	mcpServerAddr string = "http://localhost:5399" // Default server address for MCP client calls
+	
+	// CLI mode configuration
+	cliMode    bool
+	cliHost    string = "localhost"
+	cliPort    int    = 5399
+	cliCommand string
+	cliArgs    []string
+	outputJSON bool
 )
 
 // --- Structs for HTTP responses ---
@@ -926,11 +934,31 @@ func main() {
 	verbose := flag.Bool("verbose", false, "Enable verbose logging of PTY stream processing.")
 	mcp := flag.Bool("mcp", false, "Run as MCP server instead of HTTP server.")
 	serverAddr := flag.String("server", "http://localhost:5399", "Server address for MCP client REST calls.")
+	cli := flag.Bool("cli", false, "Run as CLI client to interact with server.")
+	host := flag.String("host", "localhost", "Server host for CLI mode.")
+	port := flag.Int("port", 5399, "Server port for CLI mode.")
+	jsonOutput := flag.Bool("json", false, "Output raw JSON response in CLI mode.")
 	flag.Parse()
 
 	verboseLoggingEnabled = *verbose
 	mcpMode = *mcp
 	mcpServerAddr = *serverAddr
+	cliMode = *cli
+	cliHost = *host
+	cliPort = *port
+	outputJSON = *jsonOutput
+
+	if cliMode {
+		args := flag.Args()
+		if len(args) == 0 {
+			printCLIUsage()
+			os.Exit(1)
+		}
+		cliCommand = args[0]
+		cliArgs = args[1:]
+		runCLIClient()
+		return
+	}
 
 	if verboseLoggingEnabled {
 		log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
@@ -1177,6 +1205,296 @@ func makeSendkeysNowaitRequest(keys string) (*SendkeysNowaitResponse, error) {
 		return nil, err
 	}
 
+	return &result, nil
+}
+
+// --- CLI Client Implementation ---
+
+func printCLIUsage() {
+	fmt.Println("PTY Automation Terminal Client")
+	fmt.Println()
+	fmt.Println("Usage:")
+	fmt.Println("  test_automation_terminal --cli [options] <command> [args...]")
+	fmt.Println()
+	fmt.Println("Options:")
+	fmt.Println("  --host string     Server host (default: localhost)")
+	fmt.Println("  --port int        Server port (default: 5399)")
+	fmt.Println("  --json           Output raw JSON response")
+	fmt.Println()
+	fmt.Println("Commands:")
+	fmt.Println("  sendkeys-nowait <keys>    Send keystroke to terminal (async)")
+	fmt.Println("  sendkeys <keys>           Send keystroke to terminal and wait for completion (sync)")
+	fmt.Println("  screen                    Get current screen content and cursor position")
+	fmt.Println("  oob-exec <cmd>            Execute command out-of-band (outside PTY)")
+	fmt.Println()
+	fmt.Println("Examples:")
+	fmt.Println("  test_automation_terminal --cli sendkeys-nowait \"ls -la\\n\"")
+	fmt.Println("  test_automation_terminal --cli sendkeys \"echo 'Hello World'\\n\"")
+	fmt.Println("  test_automation_terminal --cli screen")
+	fmt.Println("  test_automation_terminal --cli oob-exec \"ps aux | grep python\"")
+	fmt.Println("  test_automation_terminal --cli --host 192.168.1.100 --port 5399 screen")
+}
+
+func runCLIClient() {
+	baseURL := fmt.Sprintf("http://%s:%d", cliHost, cliPort)
+	
+	switch cliCommand {
+	case "sendkeys-nowait":
+		if len(cliArgs) != 1 {
+			fmt.Fprintf(os.Stderr, "Error: sendkeys-nowait requires exactly one argument (keys)\n")
+			os.Exit(1)
+		}
+		keys := processEscapeSequences(cliArgs[0])
+		resp, err := makeCLISendkeysNowaitRequest(baseURL, keys)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if outputJSON {
+			printJSON(resp)
+		} else {
+			printSendkeysNowaitResponse(resp)
+		}
+		
+	case "sendkeys":
+		if len(cliArgs) != 1 {
+			fmt.Fprintf(os.Stderr, "Error: sendkeys requires exactly one argument (keys)\n")
+			os.Exit(1)
+		}
+		keys := processEscapeSequences(cliArgs[0])
+		resp, err := makeCLISendkeysRequest(baseURL, keys)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if outputJSON {
+			printJSON(resp)
+		} else {
+			printSendkeysResponse(resp)
+		}
+		
+	case "screen":
+		if len(cliArgs) != 0 {
+			fmt.Fprintf(os.Stderr, "Error: screen command takes no arguments\n")
+			os.Exit(1)
+		}
+		resp, err := makeCLIScreenRequest(baseURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if outputJSON {
+			printJSON(resp)
+		} else {
+			printScreenResponse(resp)
+		}
+		
+	case "oob-exec":
+		if len(cliArgs) != 1 {
+			fmt.Fprintf(os.Stderr, "Error: oob-exec requires exactly one argument (command)\n")
+			os.Exit(1)
+		}
+		cmd := cliArgs[0]
+		resp, err := makeCLIOOBExecRequest(baseURL, cmd)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if outputJSON {
+			printJSON(resp)
+		} else {
+			printOOBExecResponse(resp)
+		}
+		
+	default:
+		fmt.Fprintf(os.Stderr, "Error: unknown command '%s'\n", cliCommand)
+		printCLIUsage()
+		os.Exit(1)
+	}
+}
+
+func processEscapeSequences(s string) string {
+	// Process common escape sequences
+	s = strings.ReplaceAll(s, "\\n", "\n")
+	s = strings.ReplaceAll(s, "\\t", "\t")
+	s = strings.ReplaceAll(s, "\\r", "\r")
+	s = strings.ReplaceAll(s, "\\\\", "\\")
+	return s
+}
+
+func printJSON(v interface{}) {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error marshaling JSON: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(data))
+}
+
+func printSendkeysNowaitResponse(resp *SendkeysNowaitResponse) {
+	if resp.Error != "" {
+		fmt.Printf("❌ Error: %s\n", resp.Error)
+		return
+	}
+	
+	if resp.Status == "success" {
+		fmt.Printf("✅ Keys sent successfully: %q\n", resp.KeysSent)
+	} else {
+		fmt.Printf("⚠️  Status: %s, Keys: %q\n", resp.Status, resp.KeysSent)
+	}
+}
+
+func printSendkeysResponse(resp *SendkeysResponse) {
+	if resp.Error != "" {
+		fmt.Printf("❌ Error: %s\n", resp.Error)
+		return
+	}
+	
+	switch resp.Status {
+	case "success":
+		fmt.Println("✅ Command completed successfully")
+	case "timeout":
+		fmt.Println("⏰ Command timed out")
+	default:
+		fmt.Printf("⚠️  Status: %s\n", resp.Status)
+	}
+	
+	if resp.Message != "" {
+		fmt.Printf("Message: %s\n", resp.Message)
+	}
+	
+	if resp.Timeout {
+		fmt.Println("⚠️  Operation timed out")
+	}
+	
+	if resp.Output != "" {
+		fmt.Println("\n--- Command Output ---")
+		fmt.Print(resp.Output)
+		fmt.Println("--- End Output ---")
+	}
+}
+
+func printScreenResponse(resp *ScreenResponse) {
+	if resp.Error != "" {
+		fmt.Printf("❌ Error: %s\n", resp.Error)
+		return
+	}
+	
+	fmt.Println("📺 Current Screen Content:")
+	fmt.Println(strings.Repeat("=", 80))
+	
+	for i, line := range resp.Screen {
+		fmt.Printf("%2d│%s\n", i, line)
+	}
+	
+	fmt.Println(strings.Repeat("=", 80))
+	
+	cursorStatus := "visible"
+	if resp.Cursor.Hidden {
+		cursorStatus = "hidden"
+	}
+	fmt.Printf("🖱️  Cursor: (%d, %d) - %s\n", resp.Cursor.X, resp.Cursor.Y, cursorStatus)
+}
+
+func printOOBExecResponse(resp *OOBExecResponse) {
+	if resp.Error != "" && resp.Error != "" {
+		fmt.Printf("❌ Error: %s\n", resp.Error)
+		return
+	}
+	
+	if resp.Timeout {
+		fmt.Println("⏰ Command timed out")
+	} else if resp.ExitCode == 0 {
+		fmt.Println("✅ Command executed successfully")
+	} else {
+		fmt.Printf("❌ Command failed with exit code: %d\n", resp.ExitCode)
+	}
+	
+	if resp.Stdout != "" {
+		fmt.Println("\n--- STDOUT ---")
+		fmt.Print(resp.Stdout)
+	}
+	
+	if resp.Stderr != "" {
+		fmt.Println("\n--- STDERR ---")
+		fmt.Print(resp.Stderr)
+	}
+	
+	if resp.Stdout != "" || resp.Stderr != "" {
+		fmt.Println("--- End Output ---")
+	}
+}
+
+// --- CLI REST Client Functions ---
+
+func makeCLISendkeysNowaitRequest(baseURL, keys string) (*SendkeysNowaitResponse, error) {
+	data := url.Values{}
+	data.Set("keys", keys)
+	
+	resp, err := http.PostForm(baseURL+"/sendkeys_nowait", data)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	var result SendkeysNowaitResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	
+	return &result, nil
+}
+
+func makeCLISendkeysRequest(baseURL, keys string) (*SendkeysResponse, error) {
+	data := url.Values{}
+	data.Set("keys", keys)
+	
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.PostForm(baseURL+"/sendkeys", data)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	var result SendkeysResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	
+	return &result, nil
+}
+
+func makeCLIScreenRequest(baseURL string) (*ScreenResponse, error) {
+	resp, err := http.Get(baseURL + "/screen")
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	var result ScreenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	
+	return &result, nil
+}
+
+func makeCLIOOBExecRequest(baseURL, cmd string) (*OOBExecResponse, error) {
+	data := url.Values{}
+	data.Set("cmd", cmd)
+	
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.PostForm(baseURL+"/oob_exec", data)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	var result OOBExecResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	
 	return &result, nil
 }
 
