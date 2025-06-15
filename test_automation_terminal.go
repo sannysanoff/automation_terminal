@@ -959,6 +959,11 @@ func main() {
 	cliPort = *port
 	outputJSON = *jsonOutput
 	keepaliveMode = *keepalive
+	
+	// Check environment variable for keepalive mode
+	if os.Getenv("KEEPALIVE") == "true" {
+		keepaliveMode = true
+	}
 
 	if cliMode {
 		args := flag.Args()
