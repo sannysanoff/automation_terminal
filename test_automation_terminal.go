@@ -1262,7 +1262,7 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	}
 
 	// Get image ID (optional parameter)
-	imageID := "automation_terminal"
+	imageID := "sannysanoff/automation_terminal"
 	if id, err := request.RequireString("workspace_id"); err == nil && id != "" {
 		imageID = id
 	}
