@@ -1334,10 +1334,56 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	dockerMutex.Lock()
 	defer dockerMutex.Unlock()
 
-	// Check if container is already running
+	// If container is already running, clean it up first
 	if dockerRunning {
-		logDebug("BEGIN: Container already running, returning error")
-		return mcp.NewToolResultError("Workspace is already running. Use 'save_work' to commit changes or stop the current workspace first."), nil
+		logInfo("BEGIN: Existing workspace is running, closing it before starting new one")
+		logDebug("BEGIN: Container already running, cleaning up first")
+		
+		// Close stdin to signal container to exit
+		if dockerStdin != nil {
+			dockerStdin.Close()
+			dockerStdin = nil
+		}
+
+		// Wait for container process to exit or kill it
+		if dockerCmd != nil && dockerCmd.Process != nil {
+			done := make(chan error, 1)
+			go func() {
+				done <- dockerCmd.Wait()
+			}()
+
+			select {
+			case err := <-done:
+				if err != nil {
+					logWarn("BEGIN: Previous Docker container exited with error: %v", err)
+				} else {
+					logInfo("BEGIN: Previous Docker container exited gracefully")
+				}
+			case <-time.After(5 * time.Second):
+				logWarn("BEGIN: Previous Docker container did not exit gracefully, killing process")
+				dockerCmd.Process.Kill()
+				<-done // Wait for process to be killed
+			}
+			dockerCmd = nil
+		}
+
+		// Stop the container if it's still running
+		if dockerContainerID != "" {
+			logInfo("BEGIN: Stopping previous Docker container: %s", dockerContainerID)
+			stopCmd := exec.Command("docker", "stop", dockerContainerID)
+			if err := stopCmd.Run(); err != nil {
+				logWarn("BEGIN: Failed to stop previous Docker container %s: %v", dockerContainerID, err)
+			} else {
+				logInfo("BEGIN: Previous Docker container %s stopped successfully", dockerContainerID)
+			}
+		}
+
+		// Reset state
+		dockerRunning = false
+		dockerContainerID = ""
+		dockerHostPort = ""
+		
+		logInfo("BEGIN: Previous workspace cleaned up, proceeding with new workspace")
 	}
 
 	// Get image ID (optional parameter)
