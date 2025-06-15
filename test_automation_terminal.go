@@ -1094,9 +1094,9 @@ func runMCPServer() {
 
 	// Add begin tool
 	beginTool := mcp.NewTool("begin",
-		mcp.WithDescription("Start a new workspace with automation terminal. Must be called before using other terminal tools."),
+		mcp.WithDescription("Open new or existing workspace with automation terminal. Must be called before using other terminal tools."),
 		mcp.WithString("image_id",
-			mcp.Description("Optional workspace image ID/name (default: sannysanoff/automation_terminal)"),
+			mcp.Description("Optional existing workspace ID to open, or leave empty for new workspace"),
 		),
 	)
 	s.AddTool(beginTool, beginToolHandler)
@@ -1262,7 +1262,7 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	}
 
 	// Get image ID (optional parameter)
-	imageID := "sannysanoff/automation_terminal"
+	imageID := "automation_terminal"
 	if id, err := request.RequireString("image_id"); err == nil && id != "" {
 		imageID = id
 	}
