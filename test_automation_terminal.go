@@ -56,9 +56,9 @@ var (
 
 	// MCP mode configuration
 	mcpMode       bool
-	mcpServerAddr string = "http://localhost:5399" // Default server address for MCP client calls
-	mcpLogFile    *os.File // Log file for MCP mode debug output
-	
+	mcpServerAddr string   = "http://localhost:5399" // Default server address for MCP client calls
+	mcpLogFile    *os.File                           // Log file for MCP mode debug output
+
 	// Docker container management for MCP mode
 	dockerContainerID string
 	dockerHostPort    string
@@ -66,7 +66,7 @@ var (
 	dockerMutex       sync.Mutex
 	dockerCmd         *exec.Cmd
 	dockerStdin       io.WriteCloser
-	
+
 	// CLI mode configuration
 	cliMode    bool
 	cliHost    string = "localhost"
@@ -74,7 +74,7 @@ var (
 	cliCommand string
 	cliArgs    []string
 	outputJSON bool
-	
+
 	// Keepalive mode configuration
 	keepaliveMode bool
 )
@@ -969,7 +969,7 @@ func main() {
 	cliPort = *port
 	outputJSON = *jsonOutput
 	keepaliveMode = *keepalive
-	
+
 	// Check environment variable for keepalive mode
 	if os.Getenv("KEEPALIVE") == "true" {
 		keepaliveMode = true
@@ -1002,7 +1002,7 @@ func main() {
 	if mcpMode {
 		// Always enable verbose logging in MCP mode
 		verboseLoggingEnabled = true
-		
+
 		// Open MCP log file for debug output
 		var err error
 		mcpLogFile, err = os.OpenFile("/tmp/linux_terminal_mcp.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -1016,7 +1016,7 @@ func main() {
 			mcpLogFile.WriteString(startupMsg)
 			mcpLogFile.Sync()
 		}
-		
+
 		logInfo("Starting in MCP server mode, server address: %s", mcpServerAddr)
 		runMCPServer()
 		return
@@ -1137,9 +1137,9 @@ func runMCPServer() {
 
 	// Add begin tool
 	beginTool := mcp.NewTool("begin",
-		mcp.WithDescription("Open new or existing workspace with automation terminal. Must be called before using other terminal tools."),
+		mcp.WithDescription("Open new or existing workspace with automation terminal. Must be called before using other terminal tools. "),
 		mcp.WithString("workspace_id",
-			mcp.Description("Optional existing workspace ID to open, or leave empty for new workspace"),
+			mcp.Description("Optional existing workspace ID to open (do not invent new), must leave empty for new workspace."),
 		),
 	)
 	s.AddTool(beginTool, beginToolHandler)
@@ -1168,7 +1168,7 @@ func sendkeysNowaitToolHandler(ctx context.Context, request mcp.CallToolRequest)
 	dockerMutex.Lock()
 	running := dockerRunning
 	dockerMutex.Unlock()
-	
+
 	if !running {
 		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
 	}
@@ -1196,7 +1196,7 @@ func sendkeysToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 	dockerMutex.Lock()
 	running := dockerRunning
 	dockerMutex.Unlock()
-	
+
 	if !running {
 		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
 	}
@@ -1232,7 +1232,7 @@ func screenToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.C
 	dockerMutex.Lock()
 	running := dockerRunning
 	dockerMutex.Unlock()
-	
+
 	if !running {
 		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
 	}
@@ -1262,7 +1262,7 @@ func oobExecToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.
 	dockerMutex.Lock()
 	running := dockerRunning
 	dockerMutex.Unlock()
-	
+
 	if !running {
 		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
 	}
@@ -1299,7 +1299,7 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	logDebug("BEGIN: Starting begin tool handler")
 	dockerMutex.Lock()
 	defer dockerMutex.Unlock()
-	
+
 	// Check if container is already running
 	if dockerRunning {
 		logDebug("BEGIN: Container already running, returning error")
@@ -1320,7 +1320,7 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	logDebug("BEGIN: Creating docker run command")
 	cmd := exec.Command("docker", "run", "--rm", "-it", "-p", ":5399", "-e", "KEEPALIVE=true", imageID)
 	logDebug("BEGIN: Docker command: %v", cmd.Args)
-	
+
 	// Get stdin pipe to send pong responses
 	logDebug("BEGIN: Getting stdin pipe for Docker container")
 	stdin, err := cmd.StdinPipe()
@@ -1328,7 +1328,7 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 		logDebug("BEGIN: Failed to get stdin pipe: %v", err)
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get stdin pipe: %v", err)), nil
 	}
-	
+
 	// Get stdout pipe to read ping messages
 	logDebug("BEGIN: Getting stdout pipe for Docker container")
 	stdout, err := cmd.StdoutPipe()
@@ -1337,7 +1337,7 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 		stdin.Close()
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get stdout pipe: %v", err)), nil
 	}
-	
+
 	// Start the container
 	logDebug("BEGIN: Starting Docker container")
 	if err := cmd.Start(); err != nil {
@@ -1441,7 +1441,7 @@ func saveWorkToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 	logDebug("SAVE_WORK: Starting save_work tool handler")
 	dockerMutex.Lock()
 	defer dockerMutex.Unlock()
-	
+
 	// Check if container is running
 	if !dockerRunning || dockerContainerID == "" {
 		logDebug("SAVE_WORK: No workspace running (dockerRunning=%t, containerID='%s')", dockerRunning, dockerContainerID)
@@ -1463,7 +1463,7 @@ func saveWorkToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 	logDebug("SAVE_WORK: Creating docker commit command")
 	commitCmd := exec.Command("docker", "commit", "-m", comment, dockerContainerID)
 	logDebug("SAVE_WORK: Docker commit command: %v", commitCmd.Args)
-	
+
 	logDebug("SAVE_WORK: Executing docker commit")
 	output, err := commitCmd.Output()
 	if err != nil {
@@ -1487,23 +1487,23 @@ func saveWorkToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 func cleanupDockerContainer() {
 	dockerMutex.Lock()
 	defer dockerMutex.Unlock()
-	
+
 	if dockerRunning {
 		logInfo("Cleaning up Docker container: %s", dockerContainerID)
-		
+
 		// Close stdin to signal container to exit
 		if dockerStdin != nil {
 			dockerStdin.Close()
 			dockerStdin = nil
 		}
-		
+
 		// Wait for container process to exit or kill it
 		if dockerCmd != nil && dockerCmd.Process != nil {
 			done := make(chan error, 1)
 			go func() {
 				done <- dockerCmd.Wait()
 			}()
-			
+
 			select {
 			case err := <-done:
 				if err != nil {
@@ -1518,7 +1518,7 @@ func cleanupDockerContainer() {
 			}
 			dockerCmd = nil
 		}
-		
+
 		dockerRunning = false
 		dockerContainerID = ""
 		dockerHostPort = ""
@@ -1575,7 +1575,7 @@ func printCLIUsage() {
 
 func runCLIClient() {
 	baseURL := fmt.Sprintf("http://%s:%d", cliHost, cliPort)
-	
+
 	switch cliCommand {
 	case "sendkeys-nowait":
 		if len(cliArgs) != 1 {
@@ -1593,7 +1593,7 @@ func runCLIClient() {
 		} else {
 			printSendkeysNowaitResponse(resp)
 		}
-		
+
 	case "sendkeys":
 		if len(cliArgs) != 1 {
 			fmt.Fprintf(os.Stderr, "Error: sendkeys requires exactly one argument (keys)\n")
@@ -1610,7 +1610,7 @@ func runCLIClient() {
 		} else {
 			printSendkeysResponse(resp)
 		}
-		
+
 	case "screen":
 		if len(cliArgs) != 0 {
 			fmt.Fprintf(os.Stderr, "Error: screen command takes no arguments\n")
@@ -1626,7 +1626,7 @@ func runCLIClient() {
 		} else {
 			printScreenResponse(resp)
 		}
-		
+
 	case "oob-exec":
 		if len(cliArgs) != 1 {
 			fmt.Fprintf(os.Stderr, "Error: oob-exec requires exactly one argument (command)\n")
@@ -1643,7 +1643,7 @@ func runCLIClient() {
 		} else {
 			printOOBExecResponse(resp)
 		}
-		
+
 	default:
 		fmt.Fprintf(os.Stderr, "Error: unknown command '%s'\n", cliCommand)
 		printCLIUsage()
@@ -1674,7 +1674,7 @@ func printSendkeysNowaitResponse(resp *SendkeysNowaitResponse) {
 		fmt.Printf("❌ Error: %s\n", resp.Error)
 		return
 	}
-	
+
 	if resp.Status == "success" {
 		fmt.Printf("✅ Keys sent successfully: %q\n", resp.KeysSent)
 	} else {
@@ -1687,7 +1687,7 @@ func printSendkeysResponse(resp *SendkeysResponse) {
 		fmt.Printf("❌ Error: %s\n", resp.Error)
 		return
 	}
-	
+
 	switch resp.Status {
 	case "success":
 		fmt.Println("✅ Command completed successfully")
@@ -1696,15 +1696,15 @@ func printSendkeysResponse(resp *SendkeysResponse) {
 	default:
 		fmt.Printf("⚠️  Status: %s\n", resp.Status)
 	}
-	
+
 	if resp.Message != "" {
 		fmt.Printf("Message: %s\n", resp.Message)
 	}
-	
+
 	if resp.Timeout {
 		fmt.Println("⚠️  Operation timed out")
 	}
-	
+
 	if resp.Output != "" {
 		fmt.Println("\n--- Command Output ---")
 		fmt.Print(resp.Output)
@@ -1717,16 +1717,16 @@ func printScreenResponse(resp *ScreenResponse) {
 		fmt.Printf("❌ Error: %s\n", resp.Error)
 		return
 	}
-	
+
 	fmt.Println("📺 Current Screen Content:")
 	fmt.Println(strings.Repeat("=", 80))
-	
+
 	for i, line := range resp.Screen {
 		fmt.Printf("%2d│%s\n", i, line)
 	}
-	
+
 	fmt.Println(strings.Repeat("=", 80))
-	
+
 	cursorStatus := "visible"
 	if resp.Cursor.Hidden {
 		cursorStatus = "hidden"
@@ -1739,7 +1739,7 @@ func printOOBExecResponse(resp *OOBExecResponse) {
 		fmt.Printf("❌ Error: %s\n", resp.Error)
 		return
 	}
-	
+
 	if resp.Timeout {
 		fmt.Println("⏰ Command timed out")
 	} else if resp.ExitCode == 0 {
@@ -1747,17 +1747,17 @@ func printOOBExecResponse(resp *OOBExecResponse) {
 	} else {
 		fmt.Printf("❌ Command failed with exit code: %d\n", resp.ExitCode)
 	}
-	
+
 	if resp.Stdout != "" {
 		fmt.Println("\n--- STDOUT ---")
 		fmt.Print(resp.Stdout)
 	}
-	
+
 	if resp.Stderr != "" {
 		fmt.Println("\n--- STDERR ---")
 		fmt.Print(resp.Stderr)
 	}
-	
+
 	if resp.Stdout != "" || resp.Stderr != "" {
 		fmt.Println("--- End Output ---")
 	}
@@ -1768,13 +1768,13 @@ func printOOBExecResponse(resp *OOBExecResponse) {
 func makeCLISendkeysNowaitRequest(baseURL, keys string) (*SendkeysNowaitResponse, error) {
 	data := url.Values{}
 	data.Set("keys", keys)
-	
+
 	resp, err := http.PostForm(baseURL+"/sendkeys_nowait", data)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	// Check HTTP status code
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -1782,27 +1782,27 @@ func makeCLISendkeysNowaitRequest(baseURL, keys string) (*SendkeysNowaitResponse
 			Error: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)),
 		}, nil
 	}
-	
+
 	var result SendkeysNowaitResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
 	}
-	
+
 	return &result, nil
 }
 
 func makeCLISendkeysRequest(baseURL, keys string) (*SendkeysResponse, error) {
 	data := url.Values{}
 	data.Set("keys", keys)
-	
+
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.PostForm(baseURL+"/sendkeys", data)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	// Check HTTP status code
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -1810,13 +1810,13 @@ func makeCLISendkeysRequest(baseURL, keys string) (*SendkeysResponse, error) {
 			Error: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)),
 		}, nil
 	}
-	
+
 	var result SendkeysResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
 	}
-	
+
 	return &result, nil
 }
 
@@ -1826,7 +1826,7 @@ func makeCLIScreenRequest(baseURL string) (*ScreenResponse, error) {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	// Check HTTP status code
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -1834,27 +1834,27 @@ func makeCLIScreenRequest(baseURL string) (*ScreenResponse, error) {
 			Error: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)),
 		}, nil
 	}
-	
+
 	var result ScreenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
 	}
-	
+
 	return &result, nil
 }
 
 func makeCLIOOBExecRequest(baseURL, cmd string) (*OOBExecResponse, error) {
 	data := url.Values{}
 	data.Set("cmd", cmd)
-	
+
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.PostForm(baseURL+"/oob_exec", data)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	// Check HTTP status code
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -1862,13 +1862,13 @@ func makeCLIOOBExecRequest(baseURL, cmd string) (*OOBExecResponse, error) {
 			Error: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)),
 		}, nil
 	}
-	
+
 	var result OOBExecResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
 	}
-	
+
 	return &result, nil
 }
 
@@ -1930,10 +1930,10 @@ func makeOOBExecRequest(cmd string) (*OOBExecResponse, error) {
 
 func runKeepaliveMode() {
 	logInfo("Starting keepalive mode - sending ping every 5 seconds, waiting for pong from stdin")
-	
+
 	// Channel to receive pong responses from stdin
 	pongChan := make(chan bool, 1)
-	
+
 	// Start stdin reader goroutine
 	go func() {
 		scanner := bufio.NewScanner(os.Stdin)
@@ -1951,17 +1951,17 @@ func runKeepaliveMode() {
 		logInfo("Stdin closed, exiting keepalive mode")
 		os.Exit(0)
 	}()
-	
+
 	missedPongs := 0
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ticker.C:
 			// Send ping
 			fmt.Println("ping")
-			
+
 			// Wait up to 5 seconds for pong
 			select {
 			case <-pongChan:
@@ -1970,7 +1970,7 @@ func runKeepaliveMode() {
 			case <-time.After(5 * time.Second):
 				missedPongs++
 				logWarn("Missed pong #%d", missedPongs)
-				
+
 				if missedPongs >= 3 {
 					logError("Three pings passed without pong response, terminating")
 					os.Exit(1)
@@ -1985,11 +1985,11 @@ func runKeepaliveMode() {
 func handleDockerKeepalive(stdout io.Reader, stdin io.Writer) {
 	logInfo("Starting Docker keepalive handler")
 	scanner := bufio.NewScanner(stdout)
-	
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		logDebug("Docker stdout: %s", line)
-		
+
 		if line == "ping" {
 			logDebug("Received ping from Docker container, sending pong")
 			if _, err := stdin.Write([]byte("pong\n")); err != nil {
@@ -1998,13 +1998,13 @@ func handleDockerKeepalive(stdout io.Reader, stdin io.Writer) {
 			}
 		}
 	}
-	
+
 	if err := scanner.Err(); err != nil {
 		logError("Error reading from Docker stdout: %v", err)
 	}
-	
+
 	logInfo("Docker keepalive handler exited")
-	
+
 	// If we exit the keepalive handler, the container likely died
 	dockerMutex.Lock()
 	if dockerRunning {
