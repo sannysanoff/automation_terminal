@@ -15,11 +15,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-	"strconv"
 
 	"github.com/Azure/go-ansiterm"
 	"github.com/creack/pty"
@@ -1024,7 +1024,7 @@ func runMCPServer() {
 
 	// Add sendkeys_nowait tool
 	sendkeysNowaitTool := mcp.NewTool("sendkeys_nowait",
-		mcp.WithDescription("Send keystrokes to terminal"),
+		mcp.WithDescription("Send keystrokes to terminal. Mostly used for interactive applications."),
 		mcp.WithString("keys",
 			mcp.Required(),
 			mcp.Description("Keys to send to the terminal"),
@@ -1034,7 +1034,7 @@ func runMCPServer() {
 
 	// Add sendkeys tool
 	sendkeysTool := mcp.NewTool("sendkeys",
-		mcp.WithDescription("Send keystrokes to terminal and wait for command completion"),
+		mcp.WithDescription("Send keystrokes to terminal and wait for command completion. Mostly used for shell commands, because it expects the process to launch and complete as result of keystroke, sending output back. Keys (command) must include newline for that."),
 		mcp.WithString("keys",
 			mcp.Required(),
 			mcp.Description("Keys to send to the terminal"),
@@ -1050,7 +1050,7 @@ func runMCPServer() {
 
 	// Add oob_exec tool
 	oobExecTool := mcp.NewTool("oob_exec",
-		mcp.WithDescription("Execute command out-of-band (not through terminal)"),
+		mcp.WithDescription("Execute command out-of-band (not through terminal). Often used to monitor command execution, and other non-interactive tasks."),
 		mcp.WithString("cmd",
 			mcp.Required(),
 			mcp.Description("Command to execute"),
@@ -1121,9 +1121,9 @@ func screenToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.C
 		return mcp.NewToolResultError(resp.Error), nil
 	}
 
-	result := fmt.Sprintf("Cursor: X=%d, Y=%d, Hidden=%t\n\nScreen Content:\n", 
+	result := fmt.Sprintf("Cursor: X=%d, Y=%d, Hidden=%t\n\nScreen Content:\n",
 		resp.Cursor.X, resp.Cursor.Y, resp.Cursor.Hidden)
-	
+
 	for i, line := range resp.Screen {
 		result += fmt.Sprintf("%2d: %s\n", i+1, line)
 	}
