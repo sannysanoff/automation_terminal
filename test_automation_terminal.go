@@ -57,6 +57,7 @@ var (
 	// MCP mode configuration
 	mcpMode       bool
 	mcpServerAddr string = "http://localhost:5399" // Default server address for MCP client calls
+	mcpLogFile    *os.File // Log file for MCP mode debug output
 	
 	// Docker container management for MCP mode
 	dockerContainerID string
@@ -119,6 +120,13 @@ func logError(format string, v ...interface{}) {
 
 func logDebug(format string, v ...interface{}) {
 	if verboseLoggingEnabled {
+		if mcpMode && mcpLogFile != nil {
+			// Write to MCP log file with PID prefix
+			pid := os.Getpid()
+			logLine := fmt.Sprintf("[%d] DEBUG: "+format+"\n", append([]interface{}{pid}, v...)...)
+			mcpLogFile.WriteString(logLine)
+			mcpLogFile.Sync() // Ensure it's written immediately
+		}
 		log.Printf("DEBUG: "+format, v...)
 	}
 }
@@ -992,6 +1000,20 @@ func main() {
 	}
 
 	if mcpMode {
+		// Open MCP log file for debug output
+		var err error
+		mcpLogFile, err = os.OpenFile("/tmp/linux_terminal_mcp.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			logError("Failed to open MCP log file: %v", err)
+		} else {
+			defer mcpLogFile.Close()
+			// Write startup message with PID
+			pid := os.Getpid()
+			startupMsg := fmt.Sprintf("[%d] MCP mode started at %s\n", pid, time.Now().Format(time.RFC3339))
+			mcpLogFile.WriteString(startupMsg)
+			mcpLogFile.Sync()
+		}
+		
 		logInfo("Starting in MCP server mode, server address: %s", mcpServerAddr)
 		runMCPServer()
 		return
