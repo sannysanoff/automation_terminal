@@ -1094,16 +1094,16 @@ func runMCPServer() {
 
 	// Add begin tool
 	beginTool := mcp.NewTool("begin",
-		mcp.WithDescription("Start a Docker container with automation terminal. Must be called before using other terminal tools."),
+		mcp.WithDescription("Start a new workspace with automation terminal. Must be called before using other terminal tools."),
 		mcp.WithString("image_id",
-			mcp.Description("Optional Docker image ID/name (default: sannysanoff/automation_terminal)"),
+			mcp.Description("Optional workspace image ID/name (default: sannysanoff/automation_terminal)"),
 		),
 	)
 	s.AddTool(beginTool, beginToolHandler)
 
 	// Add save_work tool
 	saveWorkTool := mcp.NewTool("save_work",
-		mcp.WithDescription("Commit current Docker container state to a new image. Requires 'begin' to be called first."),
+		mcp.WithDescription("Commit current workspace state to a new image. Requires 'begin' to be called first."),
 		mcp.WithString("comment",
 			mcp.Required(),
 			mcp.Description("Commit message describing the work done"),
@@ -1127,7 +1127,7 @@ func sendkeysNowaitToolHandler(ctx context.Context, request mcp.CallToolRequest)
 	dockerMutex.Unlock()
 	
 	if !running {
-		return mcp.NewToolResultError("Docker container not running. Please call 'begin' tool first."), nil
+		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
 	}
 
 	keys, err := request.RequireString("keys")
@@ -1155,7 +1155,7 @@ func sendkeysToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 	dockerMutex.Unlock()
 	
 	if !running {
-		return mcp.NewToolResultError("Docker container not running. Please call 'begin' tool first."), nil
+		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
 	}
 
 	keys, err := request.RequireString("keys")
@@ -1191,7 +1191,7 @@ func screenToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.C
 	dockerMutex.Unlock()
 	
 	if !running {
-		return mcp.NewToolResultError("Docker container not running. Please call 'begin' tool first."), nil
+		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
 	}
 
 	// Make REST call to /screen endpoint
@@ -1221,7 +1221,7 @@ func oobExecToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.
 	dockerMutex.Unlock()
 	
 	if !running {
-		return mcp.NewToolResultError("Docker container not running. Please call 'begin' tool first."), nil
+		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
 	}
 
 	cmd, err := request.RequireString("cmd")
@@ -1258,7 +1258,7 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	
 	// Check if container is already running
 	if dockerRunning {
-		return mcp.NewToolResultError("Docker container is already running. Use 'save_work' to commit changes or stop the current container first."), nil
+		return mcp.NewToolResultError("Workspace is already running. Use 'save_work' to commit changes or stop the current workspace first."), nil
 	}
 
 	// Get image ID (optional parameter)
@@ -1322,7 +1322,7 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 
 	logInfo("Docker container ready. Host port: %s, Container ID: %s", hostPort, containerID)
 
-	return mcp.NewToolResultText(fmt.Sprintf("Docker container started successfully!\nContainer ID: %s\nHost Port: %s\nServer URL: %s", containerID, hostPort, mcpServerAddr)), nil
+	return mcp.NewToolResultText(fmt.Sprintf("Workspace started successfully!\nWorkspace ID: %s\nHost Port: %s\nServer URL: %s", containerID, hostPort, mcpServerAddr)), nil
 }
 
 func saveWorkToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1331,7 +1331,7 @@ func saveWorkToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 	
 	// Check if container is running
 	if !dockerRunning || dockerContainerID == "" {
-		return mcp.NewToolResultError("No Docker container is running. Please call 'begin' tool first."), nil
+		return mcp.NewToolResultError("No workspace is running. Please call 'begin' tool first."), nil
 	}
 
 	comment, err := request.RequireString("comment")
@@ -1354,7 +1354,7 @@ func saveWorkToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 
 	logInfo("Docker container committed successfully. New image ID: %s", imageID)
 
-	return mcp.NewToolResultText(fmt.Sprintf("Work saved successfully!\nNew Image ID: %s\nCommit Message: %s\nContainer ID: %s", imageID, comment, dockerContainerID)), nil
+	return mcp.NewToolResultText(fmt.Sprintf("Work saved successfully!\nNew Image ID: %s\nCommit Message: %s\nWorkspace ID: %s", imageID, comment, dockerContainerID)), nil
 }
 
 func cleanupDockerContainer() {
