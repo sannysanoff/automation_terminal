@@ -476,62 +476,17 @@ func sendkeysHandler(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		if runtime.GOOS == "darwin" {
-			// macOS: check pstree
-			pstreeCmd := exec.Command("pstree", fmt.Sprintf("%d", shellPID))
-			pstreeOut, pstreeErr := pstreeCmd.CombinedOutput()
-			logDebug("pstree for PID %d: Output:\n%s", shellPID, string(pstreeOut))
-
-			if pstreeErr == nil {
-				lines := strings.Split(strings.TrimSpace(string(pstreeOut)), "\n")
-				actualLines := 0
-				for _, line := range lines {
-					if strings.TrimSpace(line) != "" {
-						actualLines++
-					}
-				}
-				if actualLines == 1 {
-					logInfo("macOS pstree check: Shell PID %d has no children. Command complete.", shellPID)
-					completionMessage = "Command completed."
-					commandCompletedNormally = true
-					break
-				}
-			} else {
-				if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
-					logInfo("Shell process (PID: %d) exited (detected after pstree failure).", shellPID)
-					completionMessage = "Shell process exited (detected after pstree failure)."
-					commandCompletedNormally = true
-					break
-				}
-				logWarn("pstree command for PID %d failed: %v. Output: %s. Assuming command still running or error with pstree.", shellPID, pstreeErr, string(pstreeOut))
+		completed, err := checkCommandCompletion(shellPID)
+		if err != nil {
+			if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
+				logInfo("Shell process (PID: %d) exited (detected after command completion check failure).", shellPID)
+				completionMessage = "Shell process exited (detected after command completion check failure)."
+				commandCompletedNormally = true
+				break
 			}
-		} else if runtime.GOOS == "linux" {
-			logDebug("Using ps/awk to check for children of shell PID %d on Linux.", shellPID)
-			psCmd := fmt.Sprintf("ps -o pid,ppid,comm -ax | awk '$2 == %d {print $1}'", shellPID)
-			cmd := exec.Command("sh", "-c", psCmd)
-
-			output, err := cmd.Output()
-			if err != nil {
-				if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
-					logInfo("Shell process (PID: %d) exited (detected after ps/awk command failure).", shellPID)
-					completionMessage = "Shell process exited (detected after ps/awk command failure)."
-					commandCompletedNormally = true
-					break
-				}
-				logWarn("ps/awk command for PID %d failed: %v. Output: %s. Assuming command still running or error with command.", shellPID, err, string(output))
-			} else {
-				trimmedOutput := strings.TrimSpace(string(output))
-				logDebug("ps/awk output for children of PID %d: '%s'", shellPID, trimmedOutput)
-				if trimmedOutput == "" {
-					logInfo("Linux ps/awk check: Shell PID %d has no children. Command complete.", shellPID)
-					completionMessage = "Command completed."
-					commandCompletedNormally = true
-					break
-				}
-			}
-		} else {
-			logWarn("Synchronous keystroke completion check is not implemented for this platform: %s. Assuming command completed.", runtime.GOOS)
-			completionMessage = fmt.Sprintf("Command completion check not available for %s.", runtime.GOOS)
+			logWarn("Command completion check for PID %d failed: %v. Assuming command still running.", shellPID, err)
+		} else if completed {
+			completionMessage = "Command completed."
 			commandCompletedNormally = true
 			break
 		}
@@ -545,62 +500,9 @@ func sendkeysHandler(w http.ResponseWriter, r *http.Request) {
 		completionMessage = fmt.Sprintf("Command did not complete within %d seconds.", syncTimeoutSeconds)
 
 		// Find child PIDs of the shell (not the shell itself)
-		var childPIDs []int
-		if runtime.GOOS == "darwin" {
-			// Use 'ps -a -o pid,ppid' to get all processes, then recursively find all descendants of shellPID
-			psCmd := exec.Command("ps", "-a", "-o", "pid,ppid")
-			out, err := psCmd.Output()
-			if err == nil {
-				type proc struct{ pid, ppid int }
-				var procs []proc
-				lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-				for _, line := range lines[1:] { // skip header
-					fields := strings.Fields(line)
-					if len(fields) != 2 {
-						continue
-					}
-					pid, err1 := strconv.Atoi(fields[0])
-					ppid, err2 := strconv.Atoi(fields[1])
-					if err1 == nil && err2 == nil {
-						procs = append(procs, proc{pid, ppid})
-					}
-				}
-				// Build map: ppid -> []pid
-				childrenMap := make(map[int][]int)
-				for _, p := range procs {
-					childrenMap[p.ppid] = append(childrenMap[p.ppid], p.pid)
-				}
-				// Recursively collect all descendants of shellPID
-				var collect func(int)
-				seen := make(map[int]bool)
-				collect = func(ppid int) {
-					for _, pid := range childrenMap[ppid] {
-						if pid == shellPID || seen[pid] {
-							continue
-						}
-						seen[pid] = true
-						childPIDs = append(childPIDs, pid)
-						collect(pid)
-					}
-				}
-				collect(shellPID)
-			}
-		} else if runtime.GOOS == "linux" {
-			// Use 'ps -o pid= --ppid <shellPID>'
-			psCmd := exec.Command("ps", "-o", "pid=", "--ppid", fmt.Sprintf("%d", shellPID))
-			out, err := psCmd.Output()
-			if err == nil {
-				lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-				for _, line := range lines {
-					line = strings.TrimSpace(line)
-					if line == "" {
-						continue
-					}
-					if pid, err := strconv.Atoi(line); err == nil && pid != shellPID {
-						childPIDs = append(childPIDs, pid)
-					}
-				}
-			}
+		childPIDs, err := getChildPIDs(shellPID)
+		if err != nil {
+			logWarn("Failed to get child PIDs for shell PID %d: %v", shellPID, err)
 		}
 
 		// Send SIGINT to each child process (not the shell)
@@ -613,58 +515,9 @@ func sendkeysHandler(w http.ResponseWriter, r *http.Request) {
 		sigintStart := time.Now()
 		for time.Since(sigintStart).Seconds() < float64(sigintWaitSeconds) {
 			// Re-check for children
-			var stillChildren []int
-			if runtime.GOOS == "darwin" {
-				psCmd := exec.Command("ps", "-a", "-o", "pid,ppid")
-				out, err := psCmd.Output()
-				if err == nil {
-					type proc struct{ pid, ppid int }
-					var procs []proc
-					lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-					for _, line := range lines[1:] { // skip header
-						fields := strings.Fields(line)
-						if len(fields) != 2 {
-							continue
-						}
-						pid, err1 := strconv.Atoi(fields[0])
-						ppid, err2 := strconv.Atoi(fields[1])
-						if err1 == nil && err2 == nil {
-							procs = append(procs, proc{pid, ppid})
-						}
-					}
-					childrenMap := make(map[int][]int)
-					for _, p := range procs {
-						childrenMap[p.ppid] = append(childrenMap[p.ppid], p.pid)
-					}
-					seen := make(map[int]bool)
-					var collect func(int)
-					collect = func(ppid int) {
-						for _, pid := range childrenMap[ppid] {
-							if pid == shellPID || seen[pid] {
-								continue
-							}
-							seen[pid] = true
-							stillChildren = append(stillChildren, pid)
-							collect(pid)
-						}
-					}
-					collect(shellPID)
-				}
-			} else if runtime.GOOS == "linux" {
-				psCmd := exec.Command("ps", "-o", "pid=", "--ppid", fmt.Sprintf("%d", shellPID))
-				out, err := psCmd.Output()
-				if err == nil {
-					lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-					for _, line := range lines {
-						line = strings.TrimSpace(line)
-						if line == "" {
-							continue
-						}
-						if pid, err := strconv.Atoi(line); err == nil && pid != shellPID {
-							stillChildren = append(stillChildren, pid)
-						}
-					}
-				}
+			stillChildren, err := getChildPIDs(shellPID)
+			if err != nil {
+				logWarn("Failed to re-check child PIDs for shell PID %d: %v", shellPID, err)
 			}
 			if len(stillChildren) == 0 {
 				logInfo("All child processes (except shell) exited after SIGINT.")
@@ -674,58 +527,9 @@ func sendkeysHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// After waiting, check again and send SIGKILL if needed
-		var stillChildren []int
-		if runtime.GOOS == "darwin" {
-			psCmd := exec.Command("ps", "-a", "-o", "pid,ppid")
-			out, err := psCmd.Output()
-			if err == nil {
-				type proc struct{ pid, ppid int }
-				var procs []proc
-				lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-				for _, line := range lines[1:] { // skip header
-					fields := strings.Fields(line)
-					if len(fields) != 2 {
-						continue
-					}
-					pid, err1 := strconv.Atoi(fields[0])
-					ppid, err2 := strconv.Atoi(fields[1])
-					if err1 == nil && err2 == nil {
-						procs = append(procs, proc{pid, ppid})
-					}
-				}
-				childrenMap := make(map[int][]int)
-				for _, p := range procs {
-					childrenMap[p.ppid] = append(childrenMap[p.ppid], p.pid)
-				}
-				seen := make(map[int]bool)
-				var collect func(int)
-				collect = func(ppid int) {
-					for _, pid := range childrenMap[ppid] {
-						if pid == shellPID || seen[pid] {
-							continue
-						}
-						seen[pid] = true
-						stillChildren = append(stillChildren, pid)
-						collect(pid)
-					}
-				}
-				collect(shellPID)
-			}
-		} else if runtime.GOOS == "linux" {
-			psCmd := exec.Command("ps", "-o", "pid=", "--ppid", fmt.Sprintf("%d", shellPID))
-			out, err := psCmd.Output()
-			if err == nil {
-				lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-				for _, line := range lines {
-					line = strings.TrimSpace(line)
-					if line == "" {
-						continue
-					}
-					if pid, err := strconv.Atoi(line); err == nil && pid != shellPID {
-						stillChildren = append(stillChildren, pid)
-					}
-				}
-			}
+		stillChildren, err := getChildPIDs(shellPID)
+		if err != nil {
+			logWarn("Failed to get remaining child PIDs for shell PID %d: %v", shellPID, err)
 		}
 		if len(stillChildren) > 0 {
 			for _, pid := range stillChildren {
@@ -918,37 +722,6 @@ func workingDirectoryHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(WorkingDirectoryResponse{WorkingDirectory: workingDir})
 }
 
-// getWorkingDirectory gets the working directory of a process by PID
-func getWorkingDirectory(pid int) (string, error) {
-	if runtime.GOOS == "linux" {
-		// On Linux, read /proc/<pid>/cwd symlink
-		cwdPath := fmt.Sprintf("/proc/%d/cwd", pid)
-		workingDir, err := os.Readlink(cwdPath)
-		if err != nil {
-			return "", fmt.Errorf("failed to read /proc/%d/cwd: %w", pid, err)
-		}
-		return workingDir, nil
-	} else if runtime.GOOS == "darwin" {
-		// On macOS, use lsof to get working directory
-		cmd := exec.Command("lsof", "-p", fmt.Sprintf("%d", pid), "-d", "cwd", "-Fn")
-		output, err := cmd.Output()
-		if err != nil {
-			return "", fmt.Errorf("lsof command failed: %w", err)
-		}
-		
-		lines := strings.Split(string(output), "\n")
-		for _, line := range lines {
-			if strings.HasPrefix(line, "n") {
-				return strings.TrimPrefix(line, "n"), nil
-			}
-		}
-		return "", fmt.Errorf("could not find working directory in lsof output")
-	} else {
-		// Fallback: try to execute pwd in the shell context
-		// This is less reliable but works on most Unix-like systems
-		return "", fmt.Errorf("getting working directory not implemented for platform: %s", runtime.GOOS)
-	}
-}
 
 // --- Write File Handler ---
 func writeFileHandler(w http.ResponseWriter, r *http.Request) {
