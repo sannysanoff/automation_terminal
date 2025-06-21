@@ -336,6 +336,12 @@ type WorkingDirectoryResponse struct {
 	Error            string `json:"error,omitempty"`
 }
 
+type WriteFileResponse struct {
+	FullPath string `json:"full_path"`
+	Size     int64  `json:"size"`
+	Error    string `json:"error,omitempty"`
+}
+
 // --- HTTP Handlers ---
 func sendkeysNowaitHandler(w http.ResponseWriter, r *http.Request) {
 	logInfo("Received POST /sendkeys_nowait. Form data: %v", r.Form)
@@ -944,6 +950,101 @@ func getWorkingDirectory(pid int) (string, error) {
 	}
 }
 
+// --- Write File Handler ---
+func writeFileHandler(w http.ResponseWriter, r *http.Request) {
+	logInfo("Received POST /write_file")
+	
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error": "POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, `{"error": "Failed to parse form data"}`, http.StatusBadRequest)
+		return
+	}
+	
+	filename := r.FormValue("filename")
+	content := r.FormValue("content")
+	
+	if filename == "" {
+		http.Error(w, `{"error": "Missing 'filename' in form data"}`, http.StatusBadRequest)
+		return
+	}
+	
+	ptyRunningMu.Lock()
+	active := ptyRunning
+	ptyRunningMu.Unlock()
+
+	if shellCmd == nil || shellCmd.Process == nil || !active {
+		logWarn("Shell process not running for /write_file")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(WriteFileResponse{Error: "Shell process is not running"})
+		return
+	}
+
+	if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
+		logWarn("Shell process has exited for /write_file")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(WriteFileResponse{Error: "Shell process has exited"})
+		return
+	}
+
+	// Get working directory of shell process
+	pid := shellCmd.Process.Pid
+	workingDir, err := getWorkingDirectory(pid)
+	if err != nil {
+		logError("Failed to get working directory for PID %d: %v", pid, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(WriteFileResponse{Error: fmt.Sprintf("Failed to get working directory: %v", err)})
+		return
+	}
+
+	// Resolve file path (absolute or relative to working directory)
+	var fullPath string
+	if filepath.IsAbs(filename) {
+		fullPath = filename
+	} else {
+		fullPath = filepath.Join(workingDir, filename)
+	}
+
+	// Clean the path to resolve any .. or . components
+	fullPath = filepath.Clean(fullPath)
+
+	// Create directory if it doesn't exist
+	dir := filepath.Dir(fullPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		logError("Failed to create directory %s: %v", dir, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(WriteFileResponse{Error: fmt.Sprintf("Failed to create directory: %v", err)})
+		return
+	}
+
+	// Write file
+	if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+		logError("Failed to write file %s: %v", fullPath, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(WriteFileResponse{Error: fmt.Sprintf("Failed to write file: %v", err)})
+		return
+	}
+
+	// Get file size
+	fileInfo, err := os.Stat(fullPath)
+	if err != nil {
+		logError("Failed to stat file %s: %v", fullPath, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(WriteFileResponse{Error: fmt.Sprintf("Failed to get file info: %v", err)})
+		return
+	}
+
+	logInfo("Successfully wrote file: %s (%d bytes)", fullPath, fileInfo.Size())
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(WriteFileResponse{
+		FullPath: fullPath,
+		Size:     fileInfo.Size(),
+	})
+}
+
 // --- Cleanup Function ---
 func cleanup() {
 	logInfo("Initiating cleanup...")
@@ -1131,6 +1232,7 @@ func main() {
 	mux.HandleFunc("/screen", screenHandler)
 	mux.HandleFunc("/oob_exec", oobExecHandler)
 	mux.HandleFunc("/working_directory", workingDirectoryHandler)
+	mux.HandleFunc("/write_file", writeFileHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			logWarn("Invalid URL accessed: %s", r.URL.Path)
@@ -1138,7 +1240,7 @@ func main() {
 			return
 		}
 		// Could serve a simple help page or redirect
-		fmt.Fprintln(w, "PTY Automation Server running. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /oob_exec, /working_directory")
+		fmt.Fprintln(w, "PTY Automation Server running. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /oob_exec, /working_directory, /write_file")
 	})
 
 	// Attempt to set host TTY to a sane state
@@ -1158,6 +1260,7 @@ func main() {
 	logInfo("  POST /sendkeys (form data: {'keys': 'your_command\\n'})")
 	logInfo("  GET  /screen")
 	logInfo("  GET  /working_directory")
+	logInfo("  POST /write_file (form data: {'filename': 'path/to/file', 'content': 'file content'})")
 
 	if err := http.ListenAndServe(httpServerAddr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logError("HTTP server ListenAndServe error: %v", err)
@@ -1237,6 +1340,20 @@ func runMCPServer() {
 		mcp.WithDescription("Get the current working directory of the terminal shell process"),
 	)
 	s.AddTool(workingDirectoryTool, workingDirectoryToolHandler)
+
+	// Add write_file tool
+	writeFileTool := mcp.NewTool("write_file",
+		mcp.WithDescription("Write content to a file. Path can be absolute or relative to shell's working directory."),
+		mcp.WithString("filename",
+			mcp.Required(),
+			mcp.Description("File path (absolute or relative to working directory)"),
+		),
+		mcp.WithString("content",
+			mcp.Required(),
+			mcp.Description("Content to write to the file"),
+		),
+	)
+	s.AddTool(writeFileTool, writeFileToolHandler)
 
 	// Add begin tool
 	beginTool := mcp.NewTool("begin",
@@ -1431,6 +1548,39 @@ func workingDirectoryToolHandler(ctx context.Context, request mcp.CallToolReques
 	}
 
 	return mcp.NewToolResultText(fmt.Sprintf("Working Directory: %s", resp.WorkingDirectory)), nil
+}
+
+func writeFileToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Check if Docker container is running
+	dockerMutex.Lock()
+	running := dockerRunning
+	dockerMutex.Unlock()
+
+	if !running {
+		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
+	}
+
+	filename, err := request.RequireString("filename")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	content, err := request.RequireString("content")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Make REST call to /write_file endpoint
+	resp, err := makeWriteFileRequest(filename, content)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to write file: %v", err)), nil
+	}
+
+	if resp.Error != "" {
+		return mcp.NewToolResultError(resp.Error), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("File written successfully:\nPath: %s\nSize: %d bytes", resp.FullPath, resp.Size)), nil
 }
 
 func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1790,6 +1940,26 @@ func makeWorkingDirectoryRequest() (*WorkingDirectoryResponse, error) {
 	return &result, nil
 }
 
+func makeWriteFileRequest(filename, content string) (*WriteFileResponse, error) {
+	data := url.Values{}
+	data.Set("filename", filename)
+	data.Set("content", content)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.PostForm(mcpServerAddr+"/write_file", data)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result WriteFileResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
 // --- CLI Client Implementation ---
 
 func printCLIUsage() {
@@ -1809,6 +1979,7 @@ func printCLIUsage() {
 	fmt.Println("  screen                    Get current screen content and cursor position")
 	fmt.Println("  oob-exec <cmd>            Execute command out-of-band (outside PTY)")
 	fmt.Println("  working-directory         Get current working directory of shell process")
+	fmt.Println("  write-file <filename> <content>  Write content to file (relative to working dir or absolute)")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  test_automation_terminal --cli sendkeys-nowait \"ls -la\\n\"")
@@ -1816,6 +1987,7 @@ func printCLIUsage() {
 	fmt.Println("  test_automation_terminal --cli screen")
 	fmt.Println("  test_automation_terminal --cli oob-exec \"ps aux | grep python\"")
 	fmt.Println("  test_automation_terminal --cli working-directory")
+	fmt.Println("  test_automation_terminal --cli write-file \"test.txt\" \"Hello World\"")
 	fmt.Println("  test_automation_terminal --cli --host 192.168.1.100 --port 5399 screen")
 }
 
@@ -1904,6 +2076,24 @@ func runCLIClient() {
 			printJSON(resp)
 		} else {
 			printWorkingDirectoryResponse(resp)
+		}
+
+	case "write-file":
+		if len(cliArgs) != 2 {
+			fmt.Fprintf(os.Stderr, "Error: write-file requires exactly two arguments (filename and content)\n")
+			os.Exit(1)
+		}
+		filename := cliArgs[0]
+		content := processEscapeSequences(cliArgs[1])
+		resp, err := makeCLIWriteFileRequest(baseURL, filename, content)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if outputJSON {
+			printJSON(resp)
+		} else {
+			printWriteFileResponse(resp)
 		}
 
 	default:
@@ -2032,6 +2222,17 @@ func printWorkingDirectoryResponse(resp *WorkingDirectoryResponse) {
 	}
 
 	fmt.Printf("📁 Working Directory: %s\n", resp.WorkingDirectory)
+}
+
+func printWriteFileResponse(resp *WriteFileResponse) {
+	if resp.Error != "" {
+		fmt.Printf("❌ Error: %s\n", resp.Error)
+		return
+	}
+
+	fmt.Printf("✅ File written successfully\n")
+	fmt.Printf("📄 Path: %s\n", resp.FullPath)
+	fmt.Printf("📏 Size: %d bytes\n", resp.Size)
 }
 
 // --- CLI REST Client Functions ---
@@ -2202,6 +2403,35 @@ func makeCLIWorkingDirectoryRequest(baseURL string) (*WorkingDirectoryResponse, 
 	return &result, nil
 }
 
+func makeCLIWriteFileRequest(baseURL, filename, content string) (*WriteFileResponse, error) {
+	data := url.Values{}
+	data.Set("filename", filename)
+	data.Set("content", content)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.PostForm(baseURL+"/write_file", data)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check HTTP status code
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return &WriteFileResponse{
+			Error: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)),
+		}, nil
+	}
+
+	var result WriteFileResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
+	}
+
+	return &result, nil
+}
+
 func makeOOBExecRequest(cmd string) (*OOBExecResponse, error) {
 	data := url.Values{}
 	data.Set("cmd", cmd)
@@ -2258,13 +2488,14 @@ func runKeepaliveMode() {
 	mux.HandleFunc("/screen", screenHandler)
 	mux.HandleFunc("/oob_exec", oobExecHandler)
 	mux.HandleFunc("/working_directory", workingDirectoryHandler)
+	mux.HandleFunc("/write_file", writeFileHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			logWarn("Invalid URL accessed: %s", r.URL.Path)
 			http.NotFound(w, r)
 			return
 		}
-		fmt.Fprintln(w, "PTY Automation Server running in keepalive mode. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /oob_exec, /working_directory")
+		fmt.Fprintln(w, "PTY Automation Server running in keepalive mode. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /oob_exec, /working_directory, /write_file")
 	})
 
 	// Start HTTP server in background
