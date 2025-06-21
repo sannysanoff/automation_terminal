@@ -12,31 +12,26 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"unsafe"
 )
 
 // getWorkingDirectory gets the working directory of a process by PID on macOS
 func getWorkingDirectory(pid int) (string, error) {
-	// Use lsof to get working directory
-	cmd := exec.Command("lsof", "-p", fmt.Sprintf("%d", pid), "-d", "cwd", "-Fn")
-	logDebug("Running lsof command: %v", cmd.Args)
-	output, err := cmd.Output()
-	if err != nil {
-		logError("lsof command failed for PID %d: %v", pid, err)
-		return "", fmt.Errorf("lsof command failed: %w", err)
+	// Use libproc to get working directory (more reliable than lsof)
+	var vnodeInfo C.struct_proc_vnodepathinfo
+
+	logDebug("Getting working directory for PID %d using libproc", pid)
+	ret := C.proc_pidinfo(C.int(pid), C.PROC_PIDVNODEPATHINFO, 0,
+		unsafe.Pointer(&vnodeInfo), C.int(unsafe.Sizeof(vnodeInfo)))
+
+	if ret <= 0 {
+		logError("proc_pidinfo failed for PID %d", pid)
+		return "", fmt.Errorf("failed to get proc info for pid %d", pid)
 	}
-	
-	logDebug("lsof output for PID %d: %q", pid, string(output))
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		logDebug("Processing lsof line: %q", line)
-		if strings.HasPrefix(line, "n") {
-			workingDir := strings.TrimPrefix(line, "n")
-			logDebug("Found working directory: %q", workingDir)
-			return workingDir, nil
-		}
-	}
-	logError("Could not find working directory in lsof output for PID %d", pid)
-	return "", fmt.Errorf("could not find working directory in lsof output")
+
+	cwd := C.GoString(&vnodeInfo.pvi_cdir.vip_path[0])
+	logDebug("Found working directory for PID %d: %q", pid, cwd)
+	return cwd, nil
 }
 
 // checkCommandCompletion checks if a command has completed by looking for child processes
