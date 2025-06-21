@@ -708,6 +708,7 @@ func workingDirectoryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pid := shellCmd.Process.Pid
+	logInfo("Getting working directory for shell PID: %d", pid)
 	workingDir, err := getWorkingDirectory(pid)
 	if err != nil {
 		logError("Failed to get working directory for PID %d: %v", pid, err)
@@ -716,6 +717,7 @@ func workingDirectoryHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	logInfo("Working directory for PID %d: '%s'", pid, workingDir)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(WorkingDirectoryResponse{WorkingDirectory: workingDir})
 }

@@ -18,17 +18,24 @@ import (
 func getWorkingDirectory(pid int) (string, error) {
 	// Use lsof to get working directory
 	cmd := exec.Command("lsof", "-p", fmt.Sprintf("%d", pid), "-d", "cwd", "-Fn")
+	logDebug("Running lsof command: %v", cmd.Args)
 	output, err := cmd.Output()
 	if err != nil {
+		logError("lsof command failed for PID %d: %v", pid, err)
 		return "", fmt.Errorf("lsof command failed: %w", err)
 	}
 	
+	logDebug("lsof output for PID %d: %q", pid, string(output))
 	lines := strings.Split(string(output), "\n")
 	for _, line := range lines {
+		logDebug("Processing lsof line: %q", line)
 		if strings.HasPrefix(line, "n") {
-			return strings.TrimPrefix(line, "n"), nil
+			workingDir := strings.TrimPrefix(line, "n")
+			logDebug("Found working directory: %q", workingDir)
+			return workingDir, nil
 		}
 	}
+	logError("Could not find working directory in lsof output for PID %d", pid)
 	return "", fmt.Errorf("could not find working directory in lsof output")
 }
 
