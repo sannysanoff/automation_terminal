@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"unsafe"
 )
 
 // getWorkingDirectory gets the working directory of a process by PID on macOS
