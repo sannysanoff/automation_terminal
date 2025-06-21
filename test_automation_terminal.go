@@ -2178,6 +2178,30 @@ func makeScreenRequest() (*ScreenResponse, error) {
 	return &result, nil
 }
 
+func makeCLIWorkingDirectoryRequest(baseURL string) (*WorkingDirectoryResponse, error) {
+	resp, err := http.Get(baseURL + "/working_directory")
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check HTTP status code
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return &WorkingDirectoryResponse{
+			Error: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)),
+		}, nil
+	}
+
+	var result WorkingDirectoryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
+	}
+
+	return &result, nil
+}
+
 func makeOOBExecRequest(cmd string) (*OOBExecResponse, error) {
 	data := url.Values{}
 	data.Set("cmd", cmd)
