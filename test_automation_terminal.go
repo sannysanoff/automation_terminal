@@ -1353,7 +1353,14 @@ func writeFileToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mc
 		return mcp.NewToolResultError(resp.Error), nil
 	}
 
-	return mcp.NewToolResultText(fmt.Sprintf("File written successfully:\nPath: %s\nSize: %d bytes", resp.FullPath, resp.Size)), nil
+	// Get working directory for additional context
+	workingDirResp, workingDirErr := makeWorkingDirectoryRequest()
+	workingDirInfo := ""
+	if workingDirErr == nil && workingDirResp.Error == "" {
+		workingDirInfo = fmt.Sprintf("\nWorking Directory: %s", workingDirResp.WorkingDirectory)
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("File written successfully:\nPath: %s\nSize: %d bytes%s", resp.FullPath, resp.Size, workingDirInfo)), nil
 }
 
 func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
