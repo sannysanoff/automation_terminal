@@ -331,6 +331,11 @@ type OOBExecResponse struct {
 	ExitCode int    `json:"exit_code"`
 }
 
+type WorkingDirectoryResponse struct {
+	WorkingDirectory string `json:"working_directory"`
+	Error            string `json:"error,omitempty"`
+}
+
 // --- HTTP Handlers ---
 func sendkeysNowaitHandler(w http.ResponseWriter, r *http.Request) {
 	logInfo("Received POST /sendkeys_nowait. Form data: %v", r.Form)
@@ -872,6 +877,73 @@ func oobExecHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// --- Working Directory Handler ---
+func workingDirectoryHandler(w http.ResponseWriter, r *http.Request) {
+	logInfo("Received GET /working_directory")
+	
+	ptyRunningMu.Lock()
+	active := ptyRunning
+	ptyRunningMu.Unlock()
+
+	if shellCmd == nil || shellCmd.Process == nil || !active {
+		logWarn("Shell process not running for /working_directory")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(WorkingDirectoryResponse{Error: "Shell process is not running"})
+		return
+	}
+
+	if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
+		logWarn("Shell process has exited for /working_directory")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(WorkingDirectoryResponse{Error: "Shell process has exited"})
+		return
+	}
+
+	pid := shellCmd.Process.Pid
+	workingDir, err := getWorkingDirectory(pid)
+	if err != nil {
+		logError("Failed to get working directory for PID %d: %v", pid, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(WorkingDirectoryResponse{Error: fmt.Sprintf("Failed to get working directory: %v", err)})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(WorkingDirectoryResponse{WorkingDirectory: workingDir})
+}
+
+// getWorkingDirectory gets the working directory of a process by PID
+func getWorkingDirectory(pid int) (string, error) {
+	if runtime.GOOS == "linux" {
+		// On Linux, read /proc/<pid>/cwd symlink
+		cwdPath := fmt.Sprintf("/proc/%d/cwd", pid)
+		workingDir, err := os.Readlink(cwdPath)
+		if err != nil {
+			return "", fmt.Errorf("failed to read /proc/%d/cwd: %w", pid, err)
+		}
+		return workingDir, nil
+	} else if runtime.GOOS == "darwin" {
+		// On macOS, use lsof to get working directory
+		cmd := exec.Command("lsof", "-p", fmt.Sprintf("%d", pid), "-d", "cwd", "-Fn")
+		output, err := cmd.Output()
+		if err != nil {
+			return "", fmt.Errorf("lsof command failed: %w", err)
+		}
+		
+		lines := strings.Split(string(output), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "n") {
+				return strings.TrimPrefix(line, "n"), nil
+			}
+		}
+		return "", fmt.Errorf("could not find working directory in lsof output")
+	} else {
+		// Fallback: try to execute pwd in the shell context
+		// This is less reliable but works on most Unix-like systems
+		return "", fmt.Errorf("getting working directory not implemented for platform: %s", runtime.GOOS)
+	}
+}
+
 // --- Cleanup Function ---
 func cleanup() {
 	logInfo("Initiating cleanup...")
@@ -1058,6 +1130,7 @@ func main() {
 	mux.HandleFunc("/sendkeys", sendkeysHandler)
 	mux.HandleFunc("/screen", screenHandler)
 	mux.HandleFunc("/oob_exec", oobExecHandler)
+	mux.HandleFunc("/working_directory", workingDirectoryHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			logWarn("Invalid URL accessed: %s", r.URL.Path)
@@ -1065,7 +1138,7 @@ func main() {
 			return
 		}
 		// Could serve a simple help page or redirect
-		fmt.Fprintln(w, "PTY Automation Server running. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /oob_exec")
+		fmt.Fprintln(w, "PTY Automation Server running. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /oob_exec, /working_directory")
 	})
 
 	// Attempt to set host TTY to a sane state
@@ -1084,6 +1157,7 @@ func main() {
 	logInfo("  POST /sendkeys_nowait (form data: {'keys': 'your_command\\n'})")
 	logInfo("  POST /sendkeys (form data: {'keys': 'your_command\\n'})")
 	logInfo("  GET  /screen")
+	logInfo("  GET  /working_directory")
 
 	if err := http.ListenAndServe(httpServerAddr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logError("HTTP server ListenAndServe error: %v", err)
@@ -1157,6 +1231,12 @@ func runMCPServer() {
 		),
 	)
 	s.AddTool(oobExecTool, oobExecToolHandler)
+
+	// Add working_directory tool
+	workingDirectoryTool := mcp.NewTool("working_directory",
+		mcp.WithDescription("Get the current working directory of the terminal shell process"),
+	)
+	s.AddTool(workingDirectoryTool, workingDirectoryToolHandler)
 
 	// Add begin tool
 	beginTool := mcp.NewTool("begin",
@@ -1328,6 +1408,29 @@ func oobExecToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.
 	}
 
 	return mcp.NewToolResultText(result), nil
+}
+
+func workingDirectoryToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Check if Docker container is running
+	dockerMutex.Lock()
+	running := dockerRunning
+	dockerMutex.Unlock()
+
+	if !running {
+		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
+	}
+
+	// Make REST call to /working_directory endpoint
+	resp, err := makeWorkingDirectoryRequest()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to get working directory: %v", err)), nil
+	}
+
+	if resp.Error != "" {
+		return mcp.NewToolResultError(resp.Error), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Working Directory: %s", resp.WorkingDirectory)), nil
 }
 
 func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1671,6 +1774,22 @@ func makeSendkeysNowaitRequest(keys string) (*SendkeysNowaitResponse, error) {
 	return &result, nil
 }
 
+func makeWorkingDirectoryRequest() (*WorkingDirectoryResponse, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(mcpServerAddr + "/working_directory")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result WorkingDirectoryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
 // --- CLI Client Implementation ---
 
 func printCLIUsage() {
@@ -1689,12 +1808,14 @@ func printCLIUsage() {
 	fmt.Println("  sendkeys <keys>           Send keystroke to terminal and wait for completion (sync)")
 	fmt.Println("  screen                    Get current screen content and cursor position")
 	fmt.Println("  oob-exec <cmd>            Execute command out-of-band (outside PTY)")
+	fmt.Println("  working-directory         Get current working directory of shell process")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  test_automation_terminal --cli sendkeys-nowait \"ls -la\\n\"")
 	fmt.Println("  test_automation_terminal --cli sendkeys \"echo 'Hello World'\\n\"")
 	fmt.Println("  test_automation_terminal --cli screen")
 	fmt.Println("  test_automation_terminal --cli oob-exec \"ps aux | grep python\"")
+	fmt.Println("  test_automation_terminal --cli working-directory")
 	fmt.Println("  test_automation_terminal --cli --host 192.168.1.100 --port 5399 screen")
 }
 
@@ -1767,6 +1888,22 @@ func runCLIClient() {
 			printJSON(resp)
 		} else {
 			printOOBExecResponse(resp)
+		}
+
+	case "working-directory":
+		if len(cliArgs) != 0 {
+			fmt.Fprintf(os.Stderr, "Error: working-directory command takes no arguments\n")
+			os.Exit(1)
+		}
+		resp, err := makeCLIWorkingDirectoryRequest(baseURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if outputJSON {
+			printJSON(resp)
+		} else {
+			printWorkingDirectoryResponse(resp)
 		}
 
 	default:
@@ -1886,6 +2023,15 @@ func printOOBExecResponse(resp *OOBExecResponse) {
 	if resp.Stdout != "" || resp.Stderr != "" {
 		fmt.Println("--- End Output ---")
 	}
+}
+
+func printWorkingDirectoryResponse(resp *WorkingDirectoryResponse) {
+	if resp.Error != "" {
+		fmt.Printf("❌ Error: %s\n", resp.Error)
+		return
+	}
+
+	fmt.Printf("📁 Working Directory: %s\n", resp.WorkingDirectory)
 }
 
 // --- CLI REST Client Functions ---
@@ -2087,13 +2233,14 @@ func runKeepaliveMode() {
 	mux.HandleFunc("/sendkeys", sendkeysHandler)
 	mux.HandleFunc("/screen", screenHandler)
 	mux.HandleFunc("/oob_exec", oobExecHandler)
+	mux.HandleFunc("/working_directory", workingDirectoryHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			logWarn("Invalid URL accessed: %s", r.URL.Path)
 			http.NotFound(w, r)
 			return
 		}
-		fmt.Fprintln(w, "PTY Automation Server running in keepalive mode. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /oob_exec")
+		fmt.Fprintln(w, "PTY Automation Server running in keepalive mode. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /oob_exec, /working_directory")
 	})
 
 	// Start HTTP server in background
