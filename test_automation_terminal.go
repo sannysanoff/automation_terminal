@@ -2044,7 +2044,11 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 		// Close stdin to signal container to exit
 		if oldStdin != nil {
 			logDebug("BEGIN: Closing Docker stdin")
-			oldStdin.Close()
+			if err := oldStdin.Close(); err != nil {
+				logDebug("BEGIN: Error closing Docker stdin: %v", err)
+			} else {
+				logDebug("BEGIN: Successfully closed Docker stdin")
+			}
 		}
 
 		// Wait for container process to exit or kill it
@@ -2139,17 +2143,20 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 		exec.Command("docker", "rm", containerID).Run()
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get stdin pipe: %v", err)), nil
 	}
+	logDebug("BEGIN: Successfully got stdin pipe for Docker container")
 
 	// Get stdout pipe to read ping messages
 	logDebug("BEGIN: Getting stdout pipe for Docker container")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		logDebug("BEGIN: Failed to get stdout pipe: %v", err)
+		logDebug("BEGIN: Closing stdin pipe due to stdout pipe failure")
 		stdin.Close()
 		// Clean up the created container
 		exec.Command("docker", "rm", containerID).Run()
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to get stdout pipe: %v", err)), nil
 	}
+	logDebug("BEGIN: Successfully got stdout pipe for Docker container")
 
 	// Start the container
 	logDebug("BEGIN: Starting Docker container")
@@ -2321,7 +2328,11 @@ func cleanupDockerContainer() {
 		// Close stdin to signal container to exit
 		if dockerStdin != nil {
 			logDebug("Closing Docker stdin")
-			dockerStdin.Close()
+			if err := dockerStdin.Close(); err != nil {
+				logDebug("Error closing Docker stdin: %v", err)
+			} else {
+				logDebug("Successfully closed Docker stdin")
+			}
 			dockerStdin = nil
 		}
 
@@ -3258,19 +3269,23 @@ func runKeepaliveMode() {
 
 	// Start stdin reader goroutine
 	go func() {
+		logDebug("KEEPALIVE_MODE: Starting stdin reader goroutine")
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
+			logDebug("KEEPALIVE_MODE: Received from stdin: '%s'", line)
 			if line == "pong" {
+				logDebug("KEEPALIVE_MODE: Received pong from stdin, signaling pong channel")
 				select {
 				case pongChan <- true:
+					logDebug("KEEPALIVE_MODE: Successfully sent pong signal to channel")
 				default:
-					// Channel full, ignore
+					logDebug("KEEPALIVE_MODE: Pong channel full, ignoring")
 				}
 			}
 		}
 		// If stdin closes, exit
-		logInfo("Stdin closed, exiting keepalive mode")
+		logInfo("KEEPALIVE_MODE: Stdin closed, exiting keepalive mode")
 		server.Shutdown(context.Background())
 		os.Exit(0)
 	}()
@@ -3283,19 +3298,21 @@ func runKeepaliveMode() {
 		select {
 		case <-ticker.C:
 			// Send ping
+			logDebug("KEEPALIVE_MODE: Sending ping to stdout")
 			fmt.Println("ping")
+			logDebug("KEEPALIVE_MODE: Sent ping, now expecting pong from stdin")
 
 			// Wait up to 5 seconds for pong
 			select {
 			case <-pongChan:
-				logInfo("Received pong, resetting missed count")
+				logInfo("KEEPALIVE_MODE: Received pong from stdin, resetting missed count")
 				missedPongs = 0
 			case <-time.After(5 * time.Second):
 				missedPongs++
-				logWarn("Missed pong #%d", missedPongs)
+				logWarn("KEEPALIVE_MODE: Missed pong #%d (no response within 5 seconds)", missedPongs)
 
 				if missedPongs >= 3 {
-					logError("Three pings passed without pong response, terminating")
+					logError("KEEPALIVE_MODE: Three pings passed without pong response, terminating")
 					server.Shutdown(context.Background())
 					os.Exit(1)
 				}
@@ -3316,40 +3333,44 @@ func handleDockerKeepalive(stdout io.Reader, stdin io.Writer) {
 	// Start scanning in a separate goroutine
 	go func() {
 		defer close(scanDone)
+		logDebug("KEEPALIVE: Starting to scan Docker stdout for ping messages")
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
-			logDebug("Docker stdout: %s", line)
+			logDebug("KEEPALIVE: Received from Docker stdout: '%s'", line)
 
 			if line == "ping" {
-				logDebug("Received ping from Docker container, sending pong")
+				logDebug("KEEPALIVE: Received ping from Docker container, preparing to send pong")
 
 				// Check if we should stop before writing
 				select {
 				case <-dockerKeepaliveDone:
-					logDebug("Keepalive handler stopping, not sending pong")
+					logDebug("KEEPALIVE: Keepalive handler stopping, not sending pong")
 					return
 				default:
 				}
 
-				logDebug("KEEPALIVE: About to write pong to stdin")
-				if _, err := stdin.Write([]byte("pong\n")); err != nil {
-					logError("Failed to send pong to Docker container: %v", err)
+				logDebug("KEEPALIVE: Writing pong to Docker stdin")
+				n, err := stdin.Write([]byte("pong\n"))
+				if err != nil {
+					logError("KEEPALIVE: Failed to write pong to Docker stdin: %v", err)
 					return
 				}
-				logDebug("KEEPALIVE: Successfully wrote pong to stdin")
+				logDebug("KEEPALIVE: Successfully wrote %d bytes (pong) to Docker stdin", n)
 			}
 		}
+		logDebug("KEEPALIVE: Finished scanning Docker stdout (scanner.Scan() returned false)")
 	}()
 
 	// Wait for either scan completion or stop signal
+	logDebug("KEEPALIVE: Waiting for scan completion or stop signal")
 	select {
 	case <-scanDone:
 		if err := scanner.Err(); err != nil {
-			logError("Error reading from Docker stdout: %v", err)
+			logError("KEEPALIVE: Error reading from Docker stdout: %v", err)
 		}
-		logInfo("Docker keepalive handler exited due to stdout close")
+		logInfo("KEEPALIVE: Docker keepalive handler exited due to stdout close")
 	case <-dockerKeepaliveDone:
-		logInfo("Docker keepalive handler exited due to stop signal")
+		logInfo("KEEPALIVE: Docker keepalive handler exited due to stop signal")
 		return
 	}
 
