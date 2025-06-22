@@ -1361,14 +1361,18 @@ func execToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 
 	// Get optional stdin
 	stdin := ""
-	if stdinVal, ok := request.Params.Arguments["stdin"].(string); ok {
-		stdin = stdinVal
+	if args, ok := request.Params.Arguments.(map[string]interface{}); ok {
+		if stdinVal, ok := args["stdin"].(string); ok {
+			stdin = stdinVal
+		}
 	}
 
 	// Get optional timeout
 	timeout := 15
-	if timeoutVal, ok := request.Params.Arguments["timeout"].(float64); ok {
-		timeout = int(timeoutVal)
+	if args, ok := request.Params.Arguments.(map[string]interface{}); ok {
+		if timeoutVal, ok := args["timeout"].(float64); ok {
+			timeout = int(timeoutVal)
+		}
 	}
 
 	// Make REST call to /exec endpoint
