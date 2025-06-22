@@ -2935,6 +2935,7 @@ func runKeepaliveMode() {
 	mux.HandleFunc("/working_directory", workingDirectoryHandler)
 	mux.HandleFunc("/write_file", writeFileHandler)
 	mux.HandleFunc("/change_working_directory", changeWorkingDirectoryHandler)
+	mux.HandleFunc("/read_file", readFileHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			logWarn("Invalid URL accessed: %s", r.URL.Path)
