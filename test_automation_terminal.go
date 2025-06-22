@@ -354,6 +354,13 @@ type ChangeWorkingDirectoryResponse struct {
 	Error                   string `json:"error,omitempty"`
 }
 
+type ReadFileResponse struct {
+	Content  string `json:"content"`
+	FullPath string `json:"full_path"`
+	Size     int64  `json:"size"`
+	Error    string `json:"error,omitempty"`
+}
+
 // --- HTTP Handlers ---
 func sendkeysNowaitHandler(w http.ResponseWriter, r *http.Request) {
 	logInfo("Received POST /sendkeys_nowait. Form data: %v", r.Form)
@@ -1059,6 +1066,92 @@ func changeWorkingDirectoryHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// --- Read File Handler ---
+func readFileHandler(w http.ResponseWriter, r *http.Request) {
+	logInfo("Received POST /read_file")
+
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error": "POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, `{"error": "Failed to parse form data"}`, http.StatusBadRequest)
+		return
+	}
+
+	filename := r.FormValue("filename")
+	if filename == "" {
+		http.Error(w, `{"error": "Missing 'filename' in form data"}`, http.StatusBadRequest)
+		return
+	}
+
+	ptyRunningMu.Lock()
+	active := ptyRunning
+	ptyRunningMu.Unlock()
+
+	if shellCmd == nil || shellCmd.Process == nil || !active {
+		logWarn("Shell process not running for /read_file")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ReadFileResponse{Error: "Shell process is not running"})
+		return
+	}
+
+	if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
+		logWarn("Shell process has exited for /read_file")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ReadFileResponse{Error: "Shell process has exited"})
+		return
+	}
+
+	// Get working directory of shell process
+	pid := shellCmd.Process.Pid
+	workingDir, err := getWorkingDirectory(pid)
+	if err != nil {
+		logError("Failed to get working directory for PID %d: %v", pid, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ReadFileResponse{Error: fmt.Sprintf("Failed to get working directory: %v", err)})
+		return
+	}
+
+	// Resolve file path (absolute or relative to working directory)
+	var fullPath string
+	if filepath.IsAbs(filename) {
+		fullPath = filename
+	} else {
+		fullPath = filepath.Join(workingDir, filename)
+	}
+
+	// Clean the path to resolve any .. or . components
+	fullPath = filepath.Clean(fullPath)
+
+	// Read file
+	content, err := os.ReadFile(fullPath)
+	if err != nil {
+		logError("Failed to read file %s: %v", fullPath, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ReadFileResponse{Error: fmt.Sprintf("Failed to read file: %v", err)})
+		return
+	}
+
+	// Get file size
+	fileInfo, err := os.Stat(fullPath)
+	if err != nil {
+		logError("Failed to stat file %s: %v", fullPath, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ReadFileResponse{Error: fmt.Sprintf("Failed to get file info: %v", err)})
+		return
+	}
+
+	logInfo("Successfully read file: %s (%d bytes)", fullPath, fileInfo.Size())
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ReadFileResponse{
+		Content:  string(content),
+		FullPath: fullPath,
+		Size:     fileInfo.Size(),
+	})
+}
+
 // shellescape escapes a string for safe use in shell commands
 func shellescape(s string) string {
 	// Simple shell escaping - wrap in single quotes and escape any single quotes
@@ -1254,6 +1347,7 @@ func main() {
 	mux.HandleFunc("/working_directory", workingDirectoryHandler)
 	mux.HandleFunc("/write_file", writeFileHandler)
 	mux.HandleFunc("/change_working_directory", changeWorkingDirectoryHandler)
+	mux.HandleFunc("/read_file", readFileHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			logWarn("Invalid URL accessed: %s", r.URL.Path)
@@ -1261,7 +1355,7 @@ func main() {
 			return
 		}
 		// Could serve a simple help page or redirect
-		fmt.Fprintln(w, "PTY Automation Server running. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /exec, /working_directory, /write_file")
+		fmt.Fprintln(w, "PTY Automation Server running. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /exec, /working_directory, /write_file, /read_file")
 	})
 
 	// Attempt to set host TTY to a sane state
@@ -1284,6 +1378,7 @@ func main() {
 	logInfo("  GET  /working_directory")
 	logInfo("  POST /write_file (form data: {'filename': 'path/to/file', 'content': 'file content'})")
 	logInfo("  POST /change_working_directory (form data: {'directory': 'path/to/directory'})")
+	logInfo("  POST /read_file (form data: {'filename': 'path/to/file'})")
 
 	if err := http.ListenAndServe(httpServerAddr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logError("HTTP server ListenAndServe error: %v", err)
@@ -1393,6 +1488,16 @@ func runMCPServer() {
 		),
 	)
 	s.AddTool(changeWorkingDirectoryTool, changeWorkingDirectoryToolHandler)
+
+	// Add read_file tool
+	readFileTool := mcp.NewTool("read_file",
+		mcp.WithDescription("Read content from a file. Path can be absolute or relative to shell's working directory."),
+		mcp.WithString("filename",
+			mcp.Required(),
+			mcp.Description("File path (absolute or relative to working directory)"),
+		),
+	)
+	s.AddTool(readFileTool, readFileToolHandler)
 
 	// Add begin tool
 	beginTool := mcp.NewTool("begin",
@@ -1685,6 +1790,43 @@ func changeWorkingDirectoryToolHandler(ctx context.Context, request mcp.CallTool
 	}
 
 	return mcp.NewToolResultText(fmt.Sprintf("Successfully changed working directory to: %s", resp.NewWorkingDirectory)), nil
+}
+
+func readFileToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Check if Docker container is running
+	dockerMutex.Lock()
+	running := dockerRunning
+	dockerMutex.Unlock()
+
+	if !running {
+		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
+	}
+
+	filename, err := request.RequireString("filename")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Make REST call to /read_file endpoint
+	resp, err := makeReadFileRequest(filename)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to read file: %v", err)), nil
+	}
+
+	if resp.Error != "" {
+		return mcp.NewToolResultError(resp.Error), nil
+	}
+
+	// Get working directory for additional context
+	workingDirResp, workingDirErr := makeWorkingDirectoryRequest()
+	workingDirInfo := ""
+	if workingDirErr == nil && workingDirResp.Error == "" {
+		workingDirInfo = fmt.Sprintf("\nWorking Directory: %s", workingDirResp.WorkingDirectory)
+	}
+
+	result := fmt.Sprintf("File read successfully:\nPath: %s\nSize: %d bytes%s\n\nContent:\n%s", resp.FullPath, resp.Size, workingDirInfo, resp.Content)
+
+	return mcp.NewToolResultText(result), nil
 }
 
 func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -2083,6 +2225,25 @@ func makeChangeWorkingDirectoryRequest(directory string) (*ChangeWorkingDirector
 	return &result, nil
 }
 
+func makeReadFileRequest(filename string) (*ReadFileResponse, error) {
+	data := url.Values{}
+	data.Set("filename", filename)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.PostForm(mcpServerAddr+"/read_file", data)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result ReadFileResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
 // --- CLI Client Implementation ---
 
 func printCLIUsage() {
@@ -2104,6 +2265,7 @@ func printCLIUsage() {
 	fmt.Println("                           Options: --stdin <text> --timeout <seconds>")
 	fmt.Println("  get-working-directory      Get current working directory of shell process")
 	fmt.Println("  write-file <filename> <content>  Write content to file (relative to working dir or absolute)")
+	fmt.Println("  read-file <filename>             Read content from file (relative to working dir or absolute)")
 	fmt.Println("  change-working-directory <dir>   Change working directory of shell process")
 	fmt.Println()
 	fmt.Println("Examples:")
@@ -2115,6 +2277,7 @@ func printCLIUsage() {
 	fmt.Println("  test_automation_terminal --cli exec --timeout 30 \"sleep\" \"5\"")
 	fmt.Println("  test_automation_terminal --cli get-working-directory")
 	fmt.Println("  test_automation_terminal --cli write-file \"test.txt\" \"Hello World\"")
+	fmt.Println("  test_automation_terminal --cli read-file \"test.txt\"")
 	fmt.Println("  test_automation_terminal --cli change-working-directory \"/tmp\"")
 	fmt.Println("  test_automation_terminal --cli --host 192.168.1.100 --port 5399 screen")
 }
@@ -2265,6 +2428,23 @@ func runCLIClient() {
 			printJSON(resp)
 		} else {
 			printChangeWorkingDirectoryResponse(resp)
+		}
+
+	case "read-file":
+		if len(cliArgs) != 1 {
+			fmt.Fprintf(os.Stderr, "Error: read-file requires exactly one argument (filename)\n")
+			os.Exit(1)
+		}
+		filename := cliArgs[0]
+		resp, err := makeCLIReadFileRequest(baseURL, filename)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if outputJSON {
+			printJSON(resp)
+		} else {
+			printReadFileResponse(resp)
 		}
 
 	default:
@@ -2419,6 +2599,20 @@ func printChangeWorkingDirectoryResponse(resp *ChangeWorkingDirectoryResponse) {
 
 	fmt.Printf("✅ Working directory changed successfully\n")
 	fmt.Printf("📁 New Directory: %s\n", resp.NewWorkingDirectory)
+}
+
+func printReadFileResponse(resp *ReadFileResponse) {
+	if resp.Error != "" {
+		fmt.Printf("❌ Error: %s\n", resp.Error)
+		return
+	}
+
+	fmt.Printf("✅ File read successfully\n")
+	fmt.Printf("📄 Path: %s\n", resp.FullPath)
+	fmt.Printf("📏 Size: %d bytes\n", resp.Size)
+	fmt.Println("\n--- File Content ---")
+	fmt.Print(resp.Content)
+	fmt.Println("--- End Content ---")
 }
 
 // --- CLI REST Client Functions ---
@@ -2647,6 +2841,34 @@ func makeCLIChangeWorkingDirectoryRequest(baseURL, directory string) (*ChangeWor
 	return &result, nil
 }
 
+func makeCLIReadFileRequest(baseURL, filename string) (*ReadFileResponse, error) {
+	data := url.Values{}
+	data.Set("filename", filename)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.PostForm(baseURL+"/read_file", data)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check HTTP status code
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return &ReadFileResponse{
+			Error: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)),
+		}, nil
+	}
+
+	var result ReadFileResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
+	}
+
+	return &result, nil
+}
+
 func makeExecRequest(args []string, stdin string, timeout int) (*ExecResponse, error) {
 	req := ExecRequest{
 		Args:    args,
@@ -2719,7 +2941,7 @@ func runKeepaliveMode() {
 			http.NotFound(w, r)
 			return
 		}
-		fmt.Fprintln(w, "PTY Automation Server running in keepalive mode. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /exec, /working_directory, /write_file, /change_working_directory")
+		fmt.Fprintln(w, "PTY Automation Server running in keepalive mode. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /exec, /working_directory, /write_file, /read_file, /change_working_directory")
 	})
 
 	// Start HTTP server in background
