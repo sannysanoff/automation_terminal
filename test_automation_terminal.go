@@ -1280,6 +1280,35 @@ func shellescape(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
+// getChildPIDs returns a list of child process IDs for the given parent PID
+func getChildPIDs(parentPID int) ([]int, error) {
+	// Use pgrep to find child processes
+	cmd := exec.Command("pgrep", "-P", strconv.Itoa(parentPID))
+	output, err := cmd.Output()
+	if err != nil {
+		// pgrep returns exit status 1 when no processes are found, which is not an error for us
+		if exitError, ok := err.(*exec.ExitError); ok && exitError.ExitCode() == 1 {
+			return []int{}, nil // No child processes found
+		}
+		return nil, err
+	}
+
+	var pids []int
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		pid, err := strconv.Atoi(line)
+		if err != nil {
+			continue // Skip invalid PIDs
+		}
+		pids = append(pids, pid)
+	}
+
+	return pids, nil
+}
+
 // --- Cleanup Function ---
 func cleanup() {
 	logInfo("Initiating cleanup...")
