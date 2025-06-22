@@ -433,9 +433,8 @@ func sendkeysHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Capture the current prompt line, then clear only previous captures
-	linesBeforeCommandEffect, currentBufferBefore := eventHandler.GetCapturedLinesAndCurrentBuffer()
+	_, currentBufferBefore := eventHandler.GetCapturedLinesAndCurrentBuffer()
 	eventHandler.ResetCapturedLinesAndSetBuffer(currentBufferBefore)
-	logDebug("SYNC: lines_before_command_effect (len %d): %v", len(linesBeforeCommandEffect), linesBeforeCommandEffect)
 	logDebug("SYNC: currentBufferBefore: '%s'", currentBufferBefore)
 
 	// Write command to PTY
@@ -455,11 +454,10 @@ func sendkeysHandler(w http.ResponseWriter, r *http.Request) {
 
 		linesAfter, finalCurrentLine := eventHandler.GetCapturedLinesAndCurrentBuffer()
 
-		outputSegment := linesAfter[len(linesBeforeCommandEffect):]
+		joined := strings.Join(linesAfter, "")
 		if finalCurrentLine != "" {
-			outputSegment = append(outputSegment, finalCurrentLine)
+			joined += finalCurrentLine
 		}
-		joined := strings.Join(outputSegment, "")
 		eventHandler.ResetCapturedLinesAndSetBuffer(finalCurrentLine)
 		logDebug("SYNC (shell exited path): Reset eventHandler captured lines. New buffer: '%s'", finalCurrentLine)
 
