@@ -1543,7 +1543,7 @@ func runMCPServer() {
 
 	// Add sendkeys_nowait tool
 	sendkeysNowaitTool := mcp.NewTool("sendkeys_nowait",
-		mcp.WithDescription("Send keystrokes to terminal. Mostly used for interactive applications."),
+		mcp.WithDescription("Send keystrokes to terminal. Usually used for interactive applications to answer questions. Should be only after sendkeys, if it stuck in interactive input. Use 'screen' tool to get text screenshot to know the question."),
 		mcp.WithString("keys",
 			mcp.Required(),
 			mcp.Description("Keys to send to the terminal"),
@@ -1553,7 +1553,7 @@ func runMCPServer() {
 
 	// Add sendkeys tool
 	sendkeysTool := mcp.NewTool("sendkeys",
-		mcp.WithDescription("Execute command in terminal and wait for completion. Must include newline at the end. Returns command output. WARNING: don't forget to escape characters if using double quotes for shell argument! WARNING: Always check command output for errors."),
+		mcp.WithDescription("Type the keys terminal and wait for completion, assuming shell prompt. Must include newline at the end. Usually will return echoed input and command output. WARNING: don't forget to escape characters if using double quotes for shell argument! WARNING: Always check command output for errors."),
 		mcp.WithString("keys",
 			mcp.Required(),
 			mcp.Description("Keys to send to the terminal"),
@@ -1563,13 +1563,13 @@ func runMCPServer() {
 
 	// Add screen tool
 	screenTool := mcp.NewTool("screen",
-		mcp.WithDescription("Get current terminal screen content"),
+		mcp.WithDescription("Get current terminal screen content in text mode."),
 	)
 	s.AddTool(screenTool, screenToolHandler)
 
 	// Add exec tool
 	execTool := mcp.NewTool("exec",
-		mcp.WithDescription("Execute command out-of-band (not through terminal). Often used to monitor command execution, and other non-interactive tasks."),
+		mcp.WithDescription("Execute command non-interactively. Prefer this mode for quick program execution."),
 		mcp.WithString("args",
 			mcp.Required(),
 			mcp.Description("Command arguments as JSON array (e.g., '[\"ls\", \"-la\"]')"),

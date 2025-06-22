@@ -2,8 +2,8 @@
 FROM python:3.11-slim-bookworm AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates build-essential git procps \
-    && rm -rf /var/lib/apt/lists/*
+    curl ca-certificates build-essential git procps mercurial silversearcher-ag \
+    tree
 
 ENV GOVERSION=1.24.3
 
@@ -19,17 +19,25 @@ RUN set -eux; \
     tar -C /usr/local -xzf /tmp/go.tar.gz; \
     rm /tmp/go.tar.gz
 
-ENV PATH="/usr/local/go/bin:${PATH}"
+ENV PATH="/usr/local/go/bin:/root/.local/bin:${PATH}"
+
+RUN python -m pip install aider-install
+RUN aider-install
 
 WORKDIR /src
+
+COPY go.mod .
+COPY go.sum .
+
+RUN go mod download
+
 COPY . .
 
-RUN go build -o /automation_terminal
+RUN go build -o automation_terminal
 
-# --- Final image ---
-FROM python:3.11-slim-bookworm
+RUN mkdir /workspace
 
-WORKDIR /
-COPY --from=build /automation_terminal /automation_terminal
+WORKDIR /workspace
 
-CMD ["/automation_terminal"]
+
+CMD ["/src/automation_terminal","--verbose"]
