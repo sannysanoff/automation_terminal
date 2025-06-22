@@ -1179,11 +1179,11 @@ func runMCPServer() {
 	)
 	s.AddTool(execTool, execToolHandler)
 
-	// Add working_directory tool
-	workingDirectoryTool := mcp.NewTool("working_directory",
+	// Add get_working_directory tool
+	getWorkingDirectoryTool := mcp.NewTool("get_working_directory",
 		mcp.WithDescription("Get the current working directory of the terminal shell process"),
 	)
-	s.AddTool(workingDirectoryTool, workingDirectoryToolHandler)
+	s.AddTool(getWorkingDirectoryTool, getWorkingDirectoryToolHandler)
 
 	// Add write_file tool
 	writeFileTool := mcp.NewTool("write_file",
@@ -1392,7 +1392,7 @@ func execToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 	return mcp.NewToolResultText(result), nil
 }
 
-func workingDirectoryToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func getWorkingDirectoryToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// Check if Docker container is running
 	dockerMutex.Lock()
 	running := dockerRunning
@@ -1851,7 +1851,7 @@ func printCLIUsage() {
 	fmt.Println("  screen                    Get current screen content and cursor position")
 	fmt.Println("  exec <cmd> [args...]      Execute command out-of-band (outside PTY)")
 	fmt.Println("                           Options: --stdin <text> --timeout <seconds>")
-	fmt.Println("  working-directory         Get current working directory of shell process")
+	fmt.Println("  get-working-directory      Get current working directory of shell process")
 	fmt.Println("  write-file <filename> <content>  Write content to file (relative to working dir or absolute)")
 	fmt.Println()
 	fmt.Println("Examples:")
@@ -1861,7 +1861,7 @@ func printCLIUsage() {
 	fmt.Println("  test_automation_terminal --cli exec \"ps\" \"aux\"")
 	fmt.Println("  test_automation_terminal --cli exec --stdin \"hello\" \"cat\"")
 	fmt.Println("  test_automation_terminal --cli exec --timeout 30 \"sleep\" \"5\"")
-	fmt.Println("  test_automation_terminal --cli working-directory")
+	fmt.Println("  test_automation_terminal --cli get-working-directory")
 	fmt.Println("  test_automation_terminal --cli write-file \"test.txt\" \"Hello World\"")
 	fmt.Println("  test_automation_terminal --cli --host 192.168.1.100 --port 5399 screen")
 }
@@ -1963,9 +1963,9 @@ func runCLIClient() {
 			printExecResponse(resp)
 		}
 
-	case "working-directory":
+	case "get-working-directory":
 		if len(cliArgs) != 0 {
-			fmt.Fprintf(os.Stderr, "Error: working-directory command takes no arguments\n")
+			fmt.Fprintf(os.Stderr, "Error: get-working-directory command takes no arguments\n")
 			os.Exit(1)
 		}
 		resp, err := makeCLIWorkingDirectoryRequest(baseURL)
