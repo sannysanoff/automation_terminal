@@ -981,7 +981,7 @@ func changeWorkingDirectoryHandler(w http.ResponseWriter, r *http.Request) {
 	logInfo("Executing cd command via sendkeys: %s", strings.TrimSpace(cdCommand))
 
 	// Capture the current prompt line, then clear only previous captures
-	linesBeforeCommandEffect, currentBufferBefore := eventHandler.GetCapturedLinesAndCurrentBuffer()
+	_, currentBufferBefore := eventHandler.GetCapturedLinesAndCurrentBuffer()
 	eventHandler.ResetCapturedLinesAndSetBuffer(currentBufferBefore)
 
 	// Write cd command to PTY
@@ -2544,12 +2544,12 @@ func runCLIClient() {
 			fmt.Fprintf(os.Stderr, "Error: exec requires at least one argument (command)\n")
 			os.Exit(1)
 		}
-		
+
 		// Parse optional flags
 		args := cliArgs
 		stdin := ""
 		timeout := 15
-		
+
 		// Simple flag parsing - look for --stdin and --timeout
 		finalArgs := []string{}
 		for i := 0; i < len(args); i++ {
@@ -2565,12 +2565,12 @@ func runCLIClient() {
 				finalArgs = append(finalArgs, args[i])
 			}
 		}
-		
+
 		if len(finalArgs) == 0 {
 			fmt.Fprintf(os.Stderr, "Error: exec requires at least one command argument\n")
 			os.Exit(1)
 		}
-		
+
 		resp, err := makeCLIExecRequest(baseURL, finalArgs, stdin, timeout)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
