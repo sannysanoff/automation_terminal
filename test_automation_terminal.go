@@ -2011,33 +2011,38 @@ func replaceInFileToolHandler(ctx context.Context, request mcp.CallToolRequest) 
 
 func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	logDebug("BEGIN: Starting begin tool handler")
+	
+	// Check if container is running and get cleanup info without holding lock
 	dockerMutex.Lock()
-	defer dockerMutex.Unlock()
+	needsCleanup := dockerRunning
+	oldContainerID := dockerContainerID
+	oldCmd := dockerCmd
+	oldStdin := dockerStdin
+	oldKeepaliveDone := dockerKeepaliveDone
+	dockerMutex.Unlock()
 
 	// If container is already running, clean it up first
-	if dockerRunning {
+	if needsCleanup {
 		logInfo("BEGIN: Existing workspace is running, closing it before starting new one")
 		logDebug("BEGIN: Container already running, cleaning up first")
 
 		// Signal keepalive handler to stop first
-		if dockerKeepaliveDone != nil {
+		if oldKeepaliveDone != nil {
 			logDebug("BEGIN: Signaling keepalive handler to stop")
-			close(dockerKeepaliveDone)
-			dockerKeepaliveDone = nil
+			close(oldKeepaliveDone)
 		}
 
 		// Close stdin to signal container to exit
-		if dockerStdin != nil {
+		if oldStdin != nil {
 			logDebug("BEGIN: Closing Docker stdin")
-			dockerStdin.Close()
-			dockerStdin = nil
+			oldStdin.Close()
 		}
 
 		// Wait for container process to exit or kill it
-		if dockerCmd != nil && dockerCmd.Process != nil {
+		if oldCmd != nil && oldCmd.Process != nil {
 			done := make(chan error, 1)
 			go func() {
-				done <- dockerCmd.Wait()
+				done <- oldCmd.Wait()
 			}()
 
 			select {
@@ -2049,27 +2054,31 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 				}
 			case <-time.After(5 * time.Second):
 				logWarn("BEGIN: Previous Docker container did not exit gracefully, killing process")
-				dockerCmd.Process.Kill()
+				oldCmd.Process.Kill()
 				<-done // Wait for process to be killed
 			}
-			dockerCmd = nil
 		}
 
 		// Stop the container if it's still running
-		if dockerContainerID != "" {
-			logInfo("BEGIN: Stopping previous Docker container: %s", dockerContainerID)
-			stopCmd := exec.Command("docker", "stop", dockerContainerID)
+		if oldContainerID != "" {
+			logInfo("BEGIN: Stopping previous Docker container: %s", oldContainerID)
+			stopCmd := exec.Command("docker", "stop", oldContainerID)
 			if err := stopCmd.Run(); err != nil {
-				logWarn("BEGIN: Failed to stop previous Docker container %s: %v", dockerContainerID, err)
+				logWarn("BEGIN: Failed to stop previous Docker container %s: %v", oldContainerID, err)
 			} else {
-				logInfo("BEGIN: Previous Docker container %s stopped successfully", dockerContainerID)
+				logInfo("BEGIN: Previous Docker container %s stopped successfully", oldContainerID)
 			}
 		}
 
-		// Reset state
+		// Reset state with lock
+		dockerMutex.Lock()
 		dockerRunning = false
 		dockerContainerID = ""
 		dockerHostPort = ""
+		dockerCmd = nil
+		dockerStdin = nil
+		dockerKeepaliveDone = nil
+		dockerMutex.Unlock()
 
 		logInfo("BEGIN: Previous workspace cleaned up, proceeding with new workspace")
 	}
@@ -2186,21 +2195,22 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 		return mcp.NewToolResultError("Failed to find host port mapping for 5399/tcp"), nil
 	}
 
-	// Update global state
+	// Update global state with lock
 	logDebug("BEGIN: Updating global state")
+	dockerMutex.Lock()
 	dockerContainerID = containerID
 	dockerHostPort = hostPort
 	dockerRunning = true
 	dockerCmd = cmd
 	dockerStdin = stdin
+	// Initialize keepalive done channel
+	dockerKeepaliveDone = make(chan struct{})
+	dockerMutex.Unlock()
 
 	// Update mcpServerAddr to use the new port
 	oldServerAddr := mcpServerAddr
 	mcpServerAddr = fmt.Sprintf("http://localhost:%s", hostPort)
 	logDebug("BEGIN: Updated server address from %s to %s", oldServerAddr, mcpServerAddr)
-
-	// Initialize keepalive done channel
-	dockerKeepaliveDone = make(chan struct{})
 
 	// Start goroutine to handle ping/pong communication
 	logDebug("BEGIN: Starting Docker keepalive handler goroutine")
