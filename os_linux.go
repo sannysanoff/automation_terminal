@@ -54,6 +54,11 @@ func getChildPIDs(shellPID int) ([]int, error) {
 	logDebug("Linux getChildPIDs: Command output: '%s'", string(out))
 	if err != nil {
 		logDebug("Linux getChildPIDs: Command failed with error: %v", err)
+		// ps returns exit status 1 when no processes are found, which is not an error for us
+		if exitError, ok := err.(*exec.ExitError); ok && exitError.ExitCode() == 1 {
+			logDebug("Linux getChildPIDs: ps returned exit code 1 (no children found), returning empty list")
+			return []int{}, nil // No child processes found
+		}
 		return childPIDs, err
 	}
 	
