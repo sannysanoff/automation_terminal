@@ -688,7 +688,7 @@ func oobExecHandler(w http.ResponseWriter, r *http.Request) {
 // --- Working Directory Handler ---
 func workingDirectoryHandler(w http.ResponseWriter, r *http.Request) {
 	logInfo("Received GET /working_directory")
-	
+
 	ptyRunningMu.Lock()
 	active := ptyRunning
 	ptyRunningMu.Unlock()
@@ -722,29 +722,28 @@ func workingDirectoryHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(WorkingDirectoryResponse{WorkingDirectory: workingDir})
 }
 
-
 // --- Write File Handler ---
 func writeFileHandler(w http.ResponseWriter, r *http.Request) {
 	logInfo("Received POST /write_file")
-	
+
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error": "POST required"}`, http.StatusMethodNotAllowed)
 		return
 	}
-	
+
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, `{"error": "Failed to parse form data"}`, http.StatusBadRequest)
 		return
 	}
-	
+
 	filename := r.FormValue("filename")
 	content := r.FormValue("content")
-	
+
 	if filename == "" {
 		http.Error(w, `{"error": "Missing 'filename' in form data"}`, http.StatusBadRequest)
 		return
 	}
-	
+
 	ptyRunningMu.Lock()
 	active := ptyRunning
 	ptyRunningMu.Unlock()
@@ -1084,7 +1083,7 @@ func runMCPServer() {
 
 	// Add sendkeys tool
 	sendkeysTool := mcp.NewTool("sendkeys",
-		mcp.WithDescription("Send keystrokes to terminal and wait for command completion. Mostly used for shell commands, because it expects the process to launch and complete as result of keystroke, sending output back. Keys (command) must include newline for that."),
+		mcp.WithDescription("Execute command in terminal and wait for completion. Must include newline at the end. Returns command output. WARNING: don't forget to escape characters if using double quotes for shell argument! WARNING: Always check command output for errors."),
 		mcp.WithString("keys",
 			mcp.Required(),
 			mcp.Description("Keys to send to the terminal"),
@@ -1372,14 +1371,14 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	if dockerRunning {
 		logInfo("BEGIN: Existing workspace is running, closing it before starting new one")
 		logDebug("BEGIN: Container already running, cleaning up first")
-		
+
 		// Signal keepalive handler to stop first
 		if dockerKeepaliveDone != nil {
 			logDebug("BEGIN: Signaling keepalive handler to stop")
 			close(dockerKeepaliveDone)
 			dockerKeepaliveDone = nil
 		}
-		
+
 		// Close stdin to signal container to exit
 		if dockerStdin != nil {
 			logDebug("BEGIN: Closing Docker stdin")
@@ -1424,7 +1423,7 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 		dockerRunning = false
 		dockerContainerID = ""
 		dockerHostPort = ""
-		
+
 		logInfo("BEGIN: Previous workspace cleaned up, proceeding with new workspace")
 	}
 
@@ -1442,7 +1441,7 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	logDebug("BEGIN: Creating docker create command")
 	createCmd := exec.Command("docker", "create", "-it", "-p", ":5399", "-e", "KEEPALIVE=true", imageID)
 	logDebug("BEGIN: Docker create command: %v", createCmd.Args)
-	
+
 	logDebug("BEGIN: Executing docker create")
 	createOutput, err := createCmd.Output()
 	if err != nil {
@@ -2284,7 +2283,7 @@ func runKeepaliveMode() {
 		Addr:    httpServerAddr,
 		Handler: mux,
 	}
-	
+
 	go func() {
 		logInfo("Starting HTTP server on %s in keepalive mode", httpServerAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -2351,7 +2350,7 @@ func handleDockerKeepalive(stdout io.Reader, stdin io.Writer) {
 
 	// Create a channel to signal when scanning is done
 	scanDone := make(chan struct{})
-	
+
 	// Start scanning in a separate goroutine
 	go func() {
 		defer close(scanDone)
@@ -2361,7 +2360,7 @@ func handleDockerKeepalive(stdout io.Reader, stdin io.Writer) {
 
 			if line == "ping" {
 				logDebug("Received ping from Docker container, sending pong")
-				
+
 				// Check if we should stop before writing
 				select {
 				case <-dockerKeepaliveDone:
@@ -2369,7 +2368,7 @@ func handleDockerKeepalive(stdout io.Reader, stdin io.Writer) {
 					return
 				default:
 				}
-				
+
 				if _, err := stdin.Write([]byte("pong\n")); err != nil {
 					logError("Failed to send pong to Docker container: %v", err)
 					return
