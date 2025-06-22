@@ -1361,13 +1361,13 @@ func execToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 
 	// Get optional stdin
 	stdin := ""
-	if stdinVal, err := request.GetString("stdin"); err == nil {
+	if stdinVal, ok := request.Params.Arguments["stdin"].(string); ok {
 		stdin = stdinVal
 	}
 
 	// Get optional timeout
 	timeout := 15
-	if timeoutVal, err := request.GetNumber("timeout"); err == nil {
+	if timeoutVal, ok := request.Params.Arguments["timeout"].(float64); ok {
 		timeout = int(timeoutVal)
 	}
 
