@@ -48,12 +48,18 @@ func getChildPIDs(shellPID int) ([]int, error) {
 	
 	// Use 'ps -o pid= --ppid <shellPID>'
 	psCmd := exec.Command("ps", "-o", "pid=", "--ppid", fmt.Sprintf("%d", shellPID))
+	logDebug("Linux getChildPIDs: Executing command: %v", psCmd.Args)
+	
 	out, err := psCmd.Output()
+	logDebug("Linux getChildPIDs: Command output: '%s'", string(out))
 	if err != nil {
+		logDebug("Linux getChildPIDs: Command failed with error: %v", err)
 		return childPIDs, err
 	}
 	
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	logDebug("Linux getChildPIDs: Split into %d lines: %v", len(lines), lines)
+	
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -61,8 +67,12 @@ func getChildPIDs(shellPID int) ([]int, error) {
 		}
 		if pid, err := strconv.Atoi(line); err == nil && pid != shellPID {
 			childPIDs = append(childPIDs, pid)
+			logDebug("Linux getChildPIDs: Found child PID: %d", pid)
+		} else if err != nil {
+			logDebug("Linux getChildPIDs: Failed to parse PID from line '%s': %v", line, err)
 		}
 	}
 	
+	logDebug("Linux getChildPIDs: Returning %d child PIDs: %v", len(childPIDs), childPIDs)
 	return childPIDs, nil
 }
