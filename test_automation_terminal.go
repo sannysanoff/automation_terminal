@@ -361,6 +361,12 @@ type ReadFileResponse struct {
 	Error    string `json:"error,omitempty"`
 }
 
+type ReplaceInFileResponse struct {
+	FullPath         string `json:"full_path"`
+	WorkingDirectory string `json:"working_directory"`
+	Error            string `json:"error,omitempty"`
+}
+
 // --- HTTP Handlers ---
 func sendkeysNowaitHandler(w http.ResponseWriter, r *http.Request) {
 	logInfo("Received POST /sendkeys_nowait. Form data: %v", r.Form)
@@ -1152,6 +1158,124 @@ func readFileHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// --- Replace In File Handler ---
+func replaceInFileHandler(w http.ResponseWriter, r *http.Request) {
+	logInfo("Received POST /replace_in_file")
+
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error": "POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, `{"error": "Failed to parse form data"}`, http.StatusBadRequest)
+		return
+	}
+
+	filename := r.FormValue("filename")
+	searchString := r.FormValue("search_string")
+	replacementString := r.FormValue("replacement_string")
+
+	if filename == "" {
+		http.Error(w, `{"error": "Missing 'filename' in form data"}`, http.StatusBadRequest)
+		return
+	}
+
+	if searchString == "" {
+		http.Error(w, `{"error": "Missing 'search_string' in form data"}`, http.StatusBadRequest)
+		return
+	}
+
+	if replacementString == "" {
+		http.Error(w, `{"error": "Missing 'replacement_string' in form data"}`, http.StatusBadRequest)
+		return
+	}
+
+	ptyRunningMu.Lock()
+	active := ptyRunning
+	ptyRunningMu.Unlock()
+
+	if shellCmd == nil || shellCmd.Process == nil || !active {
+		logWarn("Shell process not running for /replace_in_file")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ReplaceInFileResponse{Error: "Shell process is not running"})
+		return
+	}
+
+	if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
+		logWarn("Shell process has exited for /replace_in_file")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ReplaceInFileResponse{Error: "Shell process has exited"})
+		return
+	}
+
+	// Get working directory of shell process
+	pid := shellCmd.Process.Pid
+	workingDir, err := getWorkingDirectory(pid)
+	if err != nil {
+		logError("Failed to get working directory for PID %d: %v", pid, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ReplaceInFileResponse{Error: fmt.Sprintf("Failed to get working directory: %v", err)})
+		return
+	}
+
+	// Resolve file path (absolute or relative to working directory)
+	var fullPath string
+	if filepath.IsAbs(filename) {
+		fullPath = filename
+	} else {
+		fullPath = filepath.Join(workingDir, filename)
+	}
+
+	// Clean the path to resolve any .. or . components
+	fullPath = filepath.Clean(fullPath)
+
+	// Read file
+	content, err := os.ReadFile(fullPath)
+	if err != nil {
+		logError("Failed to read file %s: %v", fullPath, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ReplaceInFileResponse{Error: fmt.Sprintf("Failed to read file: %v", err), WorkingDirectory: workingDir})
+		return
+	}
+
+	contentStr := string(content)
+
+	// Count occurrences of search string - spaces and other characters must match exactly
+	occurrences := strings.Count(contentStr, searchString)
+	if occurrences == 0 {
+		logError("Search string not found in file %s", fullPath)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ReplaceInFileResponse{Error: "Search string not found in file", FullPath: fullPath, WorkingDirectory: workingDir})
+		return
+	}
+
+	if occurrences > 1 {
+		logError("Multiple occurrences (%d) of search string found in file %s", occurrences, fullPath)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ReplaceInFileResponse{Error: fmt.Sprintf("Multiple occurrences (%d) of search string found in file", occurrences), FullPath: fullPath, WorkingDirectory: workingDir})
+		return
+	}
+
+	// Perform replacement
+	newContent := strings.Replace(contentStr, searchString, replacementString, 1)
+
+	// Write file back
+	if err := os.WriteFile(fullPath, []byte(newContent), 0644); err != nil {
+		logError("Failed to write file %s: %v", fullPath, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ReplaceInFileResponse{Error: fmt.Sprintf("Failed to write file: %v", err), FullPath: fullPath, WorkingDirectory: workingDir})
+		return
+	}
+
+	logInfo("Successfully replaced text in file: %s", fullPath)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ReplaceInFileResponse{
+		FullPath:         fullPath,
+		WorkingDirectory: workingDir,
+	})
+}
+
 // shellescape escapes a string for safe use in shell commands
 func shellescape(s string) string {
 	// Simple shell escaping - wrap in single quotes and escape any single quotes
@@ -1348,6 +1472,7 @@ func main() {
 	mux.HandleFunc("/write_file", writeFileHandler)
 	mux.HandleFunc("/change_working_directory", changeWorkingDirectoryHandler)
 	mux.HandleFunc("/read_file", readFileHandler)
+	mux.HandleFunc("/replace_in_file", replaceInFileHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			logWarn("Invalid URL accessed: %s", r.URL.Path)
@@ -1379,6 +1504,7 @@ func main() {
 	logInfo("  POST /write_file (form data: {'filename': 'path/to/file', 'content': 'file content'})")
 	logInfo("  POST /change_working_directory (form data: {'directory': 'path/to/directory'})")
 	logInfo("  POST /read_file (form data: {'filename': 'path/to/file'})")
+	logInfo("  POST /replace_in_file (form data: {'filename': 'path/to/file', 'search_string': 'text to find', 'replacement_string': 'replacement text'})")
 
 	if err := http.ListenAndServe(httpServerAddr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logError("HTTP server ListenAndServe error: %v", err)
@@ -1498,6 +1624,24 @@ func runMCPServer() {
 		),
 	)
 	s.AddTool(readFileTool, readFileToolHandler)
+
+	// Add replace_in_file tool
+	replaceInFileTool := mcp.NewTool("replace_in_file",
+		mcp.WithDescription("Replace text in a file. Spaces and other characters from search_string must match exactly. Fails if multiple occurrences found or file not found."),
+		mcp.WithString("filename",
+			mcp.Required(),
+			mcp.Description("File path (absolute or relative to working directory)"),
+		),
+		mcp.WithString("search_string",
+			mcp.Required(),
+			mcp.Description("Text to search for (must match exactly including spaces and other characters)"),
+		),
+		mcp.WithString("replacement_string",
+			mcp.Required(),
+			mcp.Description("Text to replace with"),
+		),
+	)
+	s.AddTool(replaceInFileTool, replaceInFileToolHandler)
 
 	// Add begin tool
 	beginTool := mcp.NewTool("begin",
@@ -1827,6 +1971,44 @@ func readFileToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 	result := fmt.Sprintf("File read successfully:\nPath: %s\nSize: %d bytes%s\n\nContent:\n%s", resp.FullPath, resp.Size, workingDirInfo, resp.Content)
 
 	return mcp.NewToolResultText(result), nil
+}
+
+func replaceInFileToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Check if Docker container is running
+	dockerMutex.Lock()
+	running := dockerRunning
+	dockerMutex.Unlock()
+
+	if !running {
+		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
+	}
+
+	filename, err := request.RequireString("filename")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	searchString, err := request.RequireString("search_string")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	replacementString, err := request.RequireString("replacement_string")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Make REST call to /replace_in_file endpoint
+	resp, err := makeReplaceInFileRequest(filename, searchString, replacementString)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to replace in file: %v", err)), nil
+	}
+
+	if resp.Error != "" {
+		return mcp.NewToolResultError(resp.Error), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Text replaced successfully in file:\nPath: %s\nWorking Directory: %s", resp.FullPath, resp.WorkingDirectory)), nil
 }
 
 func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -2244,6 +2426,27 @@ func makeReadFileRequest(filename string) (*ReadFileResponse, error) {
 	return &result, nil
 }
 
+func makeReplaceInFileRequest(filename, searchString, replacementString string) (*ReplaceInFileResponse, error) {
+	data := url.Values{}
+	data.Set("filename", filename)
+	data.Set("search_string", searchString)
+	data.Set("replacement_string", replacementString)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.PostForm(mcpServerAddr+"/replace_in_file", data)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result ReplaceInFileResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
 // --- CLI Client Implementation ---
 
 func printCLIUsage() {
@@ -2266,6 +2469,7 @@ func printCLIUsage() {
 	fmt.Println("  get-working-directory      Get current working directory of shell process")
 	fmt.Println("  write-file <filename> <content>  Write content to file (relative to working dir or absolute)")
 	fmt.Println("  read-file <filename>             Read content from file (relative to working dir or absolute)")
+	fmt.Println("  replace-in-file <filename> <search> <replacement>  Replace text in file (exact match required)")
 	fmt.Println("  change-working-directory <dir>   Change working directory of shell process")
 	fmt.Println()
 	fmt.Println("Examples:")
@@ -2278,6 +2482,7 @@ func printCLIUsage() {
 	fmt.Println("  test_automation_terminal --cli get-working-directory")
 	fmt.Println("  test_automation_terminal --cli write-file \"test.txt\" \"Hello World\"")
 	fmt.Println("  test_automation_terminal --cli read-file \"test.txt\"")
+	fmt.Println("  test_automation_terminal --cli replace-in-file \"test.txt\" \"Hello\" \"Hi\"")
 	fmt.Println("  test_automation_terminal --cli change-working-directory \"/tmp\"")
 	fmt.Println("  test_automation_terminal --cli --host 192.168.1.100 --port 5399 screen")
 }
@@ -2447,6 +2652,25 @@ func runCLIClient() {
 			printReadFileResponse(resp)
 		}
 
+	case "replace-in-file":
+		if len(cliArgs) != 3 {
+			fmt.Fprintf(os.Stderr, "Error: replace-in-file requires exactly three arguments (filename, search_string, replacement_string)\n")
+			os.Exit(1)
+		}
+		filename := cliArgs[0]
+		searchString := processEscapeSequences(cliArgs[1])
+		replacementString := processEscapeSequences(cliArgs[2])
+		resp, err := makeCLIReplaceInFileRequest(baseURL, filename, searchString, replacementString)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if outputJSON {
+			printJSON(resp)
+		} else {
+			printReplaceInFileResponse(resp)
+		}
+
 	default:
 		fmt.Fprintf(os.Stderr, "Error: unknown command '%s'\n", cliCommand)
 		printCLIUsage()
@@ -2613,6 +2837,20 @@ func printReadFileResponse(resp *ReadFileResponse) {
 	fmt.Println("\n--- File Content ---")
 	fmt.Print(resp.Content)
 	fmt.Println("--- End Content ---")
+}
+
+func printReplaceInFileResponse(resp *ReplaceInFileResponse) {
+	if resp.Error != "" {
+		fmt.Printf("❌ Error: %s\n", resp.Error)
+		if resp.WorkingDirectory != "" {
+			fmt.Printf("📁 Working Directory: %s\n", resp.WorkingDirectory)
+		}
+		return
+	}
+
+	fmt.Printf("✅ Text replaced successfully in file\n")
+	fmt.Printf("📄 Path: %s\n", resp.FullPath)
+	fmt.Printf("📁 Working Directory: %s\n", resp.WorkingDirectory)
 }
 
 // --- CLI REST Client Functions ---
@@ -2861,6 +3099,29 @@ func makeCLIReadFileRequest(baseURL, filename string) (*ReadFileResponse, error)
 	}
 
 	var result ReadFileResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
+	}
+
+	return &result, nil
+}
+
+func makeCLIReplaceInFileRequest(baseURL, filename, searchString, replacementString string) (*ReplaceInFileResponse, error) {
+	data := url.Values{}
+	data.Set("filename", filename)
+	data.Set("search_string", searchString)
+	data.Set("replacement_string", replacementString)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.PostForm(baseURL+"/replace_in_file", data)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check HTTP status code - allow various status codes as they're handled in the response
+	var result ReplaceInFileResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
