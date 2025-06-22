@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -1359,14 +1360,15 @@ func execToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Cal
 	}
 
 	// Get optional stdin
-	stdin, _ := request.Params["stdin"].(string)
+	stdin := ""
+	if stdinVal, err := request.GetString("stdin"); err == nil {
+		stdin = stdinVal
+	}
 
 	// Get optional timeout
 	timeout := 15
-	if timeoutVal, ok := request.Params["timeout"]; ok {
-		if timeoutFloat, ok := timeoutVal.(float64); ok {
-			timeout = int(timeoutFloat)
-		}
+	if timeoutVal, err := request.GetNumber("timeout"); err == nil {
+		timeout = int(timeoutVal)
 	}
 
 	// Make REST call to /exec endpoint
