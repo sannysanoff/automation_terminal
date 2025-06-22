@@ -348,6 +348,12 @@ type WriteFileResponse struct {
 	Error    string `json:"error,omitempty"`
 }
 
+type ChangeWorkingDirectoryResponse struct {
+	NewWorkingDirectory     string `json:"new_working_directory,omitempty"`
+	CurrentWorkingDirectory string `json:"current_working_directory,omitempty"`
+	Error                   string `json:"error,omitempty"`
+}
+
 // --- HTTP Handlers ---
 func sendkeysNowaitHandler(w http.ResponseWriter, r *http.Request) {
 	logInfo("Received POST /sendkeys_nowait. Form data: %v", r.Form)
@@ -883,6 +889,182 @@ func writeFileHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// --- Change Working Directory Handler ---
+func changeWorkingDirectoryHandler(w http.ResponseWriter, r *http.Request) {
+	logInfo("Received POST /change_working_directory")
+
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error": "POST required"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, `{"error": "Failed to parse form data"}`, http.StatusBadRequest)
+		return
+	}
+
+	directory := r.FormValue("directory")
+	if directory == "" {
+		http.Error(w, `{"error": "Missing 'directory' in form data"}`, http.StatusBadRequest)
+		return
+	}
+
+	ptyRunningMu.Lock()
+	active := ptyRunning
+	ptyRunningMu.Unlock()
+
+	if shellCmd == nil || shellCmd.Process == nil || !active || ptySlaveForTcgetpgrp == nil {
+		logWarn("PTY not active for /change_working_directory")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ChangeWorkingDirectoryResponse{Error: "PTY not active or not initialized"})
+		return
+	}
+
+	if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
+		logWarn("Shell process not running for /change_working_directory")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(ChangeWorkingDirectoryResponse{Error: "Shell process is not running"})
+		return
+	}
+
+	// Check if shell has child processes running
+	shellPID := shellCmd.Process.Pid
+	childPIDs, err := getChildPIDs(shellPID)
+	if err != nil {
+		logError("Failed to get child PIDs for shell PID %d: %v", shellPID, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ChangeWorkingDirectoryResponse{Error: fmt.Sprintf("Failed to check for running processes: %v", err)})
+		return
+	}
+
+	if len(childPIDs) > 0 {
+		logWarn("Shell has running child processes, cannot change directory")
+		currentDir, _ := getWorkingDirectory(shellPID)
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(ChangeWorkingDirectoryResponse{
+			Error:                   "Cannot change directory while shell has running processes",
+			CurrentWorkingDirectory: currentDir,
+		})
+		return
+	}
+
+	// Get current working directory before change
+	currentDir, err := getWorkingDirectory(shellPID)
+	if err != nil {
+		logError("Failed to get current working directory for PID %d: %v", shellPID, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ChangeWorkingDirectoryResponse{Error: fmt.Sprintf("Failed to get current working directory: %v", err)})
+		return
+	}
+
+	// Normalize the requested directory path
+	var targetDir string
+	if filepath.IsAbs(directory) {
+		targetDir = filepath.Clean(directory)
+	} else {
+		targetDir = filepath.Clean(filepath.Join(currentDir, directory))
+	}
+
+	// Use sendkeys to execute cd command
+	cdCommand := fmt.Sprintf("cd %s\n", shellescape(directory))
+	logInfo("Executing cd command via sendkeys: %s", strings.TrimSpace(cdCommand))
+
+	// Capture the current prompt line, then clear only previous captures
+	linesBeforeCommandEffect, currentBufferBefore := eventHandler.GetCapturedLinesAndCurrentBuffer()
+	eventHandler.ResetCapturedLinesAndSetBuffer(currentBufferBefore)
+
+	// Write cd command to PTY
+	_, err = ptyMaster.WriteString(cdCommand)
+	if err != nil {
+		logError("Error writing cd command to PTY: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ChangeWorkingDirectoryResponse{
+			Error:                   fmt.Sprintf("Error writing cd command to PTY: %v", err),
+			CurrentWorkingDirectory: currentDir,
+		})
+		return
+	}
+
+	// Wait for command completion
+	time.Sleep(1 * time.Second)
+
+	// Wait for cd command to complete
+	startTime := time.Now()
+	const cdTimeoutSeconds = 10
+	commandCompleted := false
+
+	for time.Since(startTime).Seconds() < float64(cdTimeoutSeconds) {
+		if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
+			logInfo("Shell process exited during cd command")
+			break
+		}
+
+		completed, err := checkCommandCompletion(shellPID)
+		if err != nil {
+			if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
+				logInfo("Shell process exited during cd command (detected after completion check failure)")
+				break
+			}
+			logWarn("Command completion check for cd command failed: %v", err)
+		} else if completed {
+			commandCompleted = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	if !commandCompleted {
+		logWarn("cd command did not complete within timeout")
+		w.WriteHeader(http.StatusRequestTimeout)
+		json.NewEncoder(w).Encode(ChangeWorkingDirectoryResponse{
+			Error:                   "cd command timed out",
+			CurrentWorkingDirectory: currentDir,
+		})
+		return
+	}
+
+	// Short delay for output processing
+	time.Sleep(200 * time.Millisecond)
+
+	// Get the new working directory
+	newDir, err := getWorkingDirectory(shellPID)
+	if err != nil {
+		logError("Failed to get new working directory for PID %d: %v", shellPID, err)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(ChangeWorkingDirectoryResponse{
+			Error:                   fmt.Sprintf("Failed to get new working directory: %v", err),
+			CurrentWorkingDirectory: currentDir,
+		})
+		return
+	}
+
+	// Check if the directory change was successful
+	if newDir != targetDir {
+		logWarn("Directory change failed. Expected: %s, Got: %s", targetDir, newDir)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ChangeWorkingDirectoryResponse{
+			Error:                   fmt.Sprintf("Directory change failed. Target: %s", targetDir),
+			CurrentWorkingDirectory: newDir,
+		})
+		return
+	}
+
+	// Clear captured output from cd command
+	eventHandler.ResetCapturedLinesAndSetBuffer("")
+
+	logInfo("Successfully changed working directory from %s to %s", currentDir, newDir)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ChangeWorkingDirectoryResponse{
+		NewWorkingDirectory: newDir,
+	})
+}
+
+// shellescape escapes a string for safe use in shell commands
+func shellescape(s string) string {
+	// Simple shell escaping - wrap in single quotes and escape any single quotes
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
 // --- Cleanup Function ---
 func cleanup() {
 	logInfo("Initiating cleanup...")
@@ -1071,6 +1253,7 @@ func main() {
 	mux.HandleFunc("/exec", execHandler)
 	mux.HandleFunc("/working_directory", workingDirectoryHandler)
 	mux.HandleFunc("/write_file", writeFileHandler)
+	mux.HandleFunc("/change_working_directory", changeWorkingDirectoryHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			logWarn("Invalid URL accessed: %s", r.URL.Path)
@@ -1100,6 +1283,7 @@ func main() {
 	logInfo("  POST /exec (JSON: {'args': ['cmd', 'arg1'], 'stdin': 'optional', 'timeout': 15})")
 	logInfo("  GET  /working_directory")
 	logInfo("  POST /write_file (form data: {'filename': 'path/to/file', 'content': 'file content'})")
+	logInfo("  POST /change_working_directory (form data: {'directory': 'path/to/directory'})")
 
 	if err := http.ListenAndServe(httpServerAddr, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logError("HTTP server ListenAndServe error: %v", err)
@@ -1199,6 +1383,16 @@ func runMCPServer() {
 		),
 	)
 	s.AddTool(writeFileTool, writeFileToolHandler)
+
+	// Add change_working_directory tool
+	changeWorkingDirectoryTool := mcp.NewTool("change_working_directory",
+		mcp.WithDescription("Change the working directory of the terminal shell. Fails if shell has running processes."),
+		mcp.WithString("directory",
+			mcp.Required(),
+			mcp.Description("Directory path (absolute or relative to current working directory)"),
+		),
+	)
+	s.AddTool(changeWorkingDirectoryTool, changeWorkingDirectoryToolHandler)
 
 	// Add begin tool
 	beginTool := mcp.NewTool("begin",
@@ -1459,6 +1653,38 @@ func writeFileToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mc
 	}
 
 	return mcp.NewToolResultText(fmt.Sprintf("File written successfully:\nPath: %s\nSize: %d bytes%s", resp.FullPath, resp.Size, workingDirInfo)), nil
+}
+
+func changeWorkingDirectoryToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	// Check if Docker container is running
+	dockerMutex.Lock()
+	running := dockerRunning
+	dockerMutex.Unlock()
+
+	if !running {
+		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
+	}
+
+	directory, err := request.RequireString("directory")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Make REST call to /change_working_directory endpoint
+	resp, err := makeChangeWorkingDirectoryRequest(directory)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Failed to change working directory: %v", err)), nil
+	}
+
+	if resp.Error != "" {
+		result := fmt.Sprintf("Failed to change working directory: %s", resp.Error)
+		if resp.CurrentWorkingDirectory != "" {
+			result += fmt.Sprintf("\nCurrent working directory: %s", resp.CurrentWorkingDirectory)
+		}
+		return mcp.NewToolResultError(result), nil
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Successfully changed working directory to: %s", resp.NewWorkingDirectory)), nil
 }
 
 func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1838,6 +2064,25 @@ func makeWriteFileRequest(filename, content string) (*WriteFileResponse, error) 
 	return &result, nil
 }
 
+func makeChangeWorkingDirectoryRequest(directory string) (*ChangeWorkingDirectoryResponse, error) {
+	data := url.Values{}
+	data.Set("directory", directory)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.PostForm(mcpServerAddr+"/change_working_directory", data)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result ChangeWorkingDirectoryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
 // --- CLI Client Implementation ---
 
 func printCLIUsage() {
@@ -1859,6 +2104,7 @@ func printCLIUsage() {
 	fmt.Println("                           Options: --stdin <text> --timeout <seconds>")
 	fmt.Println("  get-working-directory      Get current working directory of shell process")
 	fmt.Println("  write-file <filename> <content>  Write content to file (relative to working dir or absolute)")
+	fmt.Println("  change-working-directory <dir>   Change working directory of shell process")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  test_automation_terminal --cli sendkeys-nowait \"ls -la\\n\"")
@@ -1869,6 +2115,7 @@ func printCLIUsage() {
 	fmt.Println("  test_automation_terminal --cli exec --timeout 30 \"sleep\" \"5\"")
 	fmt.Println("  test_automation_terminal --cli get-working-directory")
 	fmt.Println("  test_automation_terminal --cli write-file \"test.txt\" \"Hello World\"")
+	fmt.Println("  test_automation_terminal --cli change-working-directory \"/tmp\"")
 	fmt.Println("  test_automation_terminal --cli --host 192.168.1.100 --port 5399 screen")
 }
 
@@ -2001,6 +2248,23 @@ func runCLIClient() {
 			printJSON(resp)
 		} else {
 			printWriteFileResponse(resp)
+		}
+
+	case "change-working-directory":
+		if len(cliArgs) != 1 {
+			fmt.Fprintf(os.Stderr, "Error: change-working-directory requires exactly one argument (directory)\n")
+			os.Exit(1)
+		}
+		directory := cliArgs[0]
+		resp, err := makeCLIChangeWorkingDirectoryRequest(baseURL, directory)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		if outputJSON {
+			printJSON(resp)
+		} else {
+			printChangeWorkingDirectoryResponse(resp)
 		}
 
 	default:
@@ -2142,6 +2406,19 @@ func printWriteFileResponse(resp *WriteFileResponse) {
 	fmt.Printf("✅ File written successfully\n")
 	fmt.Printf("📄 Path: %s\n", resp.FullPath)
 	fmt.Printf("📏 Size: %d bytes\n", resp.Size)
+}
+
+func printChangeWorkingDirectoryResponse(resp *ChangeWorkingDirectoryResponse) {
+	if resp.Error != "" {
+		fmt.Printf("❌ Error: %s\n", resp.Error)
+		if resp.CurrentWorkingDirectory != "" {
+			fmt.Printf("📁 Current Directory: %s\n", resp.CurrentWorkingDirectory)
+		}
+		return
+	}
+
+	fmt.Printf("✅ Working directory changed successfully\n")
+	fmt.Printf("📁 New Directory: %s\n", resp.NewWorkingDirectory)
 }
 
 // --- CLI REST Client Functions ---
@@ -2349,6 +2626,27 @@ func makeCLIWriteFileRequest(baseURL, filename, content string) (*WriteFileRespo
 	return &result, nil
 }
 
+func makeCLIChangeWorkingDirectoryRequest(baseURL, directory string) (*ChangeWorkingDirectoryResponse, error) {
+	data := url.Values{}
+	data.Set("directory", directory)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.PostForm(baseURL+"/change_working_directory", data)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check HTTP status code - allow various status codes as they're handled in the response
+	var result ChangeWorkingDirectoryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
+	}
+
+	return &result, nil
+}
+
 func makeExecRequest(args []string, stdin string, timeout int) (*ExecResponse, error) {
 	req := ExecRequest{
 		Args:    args,
@@ -2414,13 +2712,14 @@ func runKeepaliveMode() {
 	mux.HandleFunc("/exec", execHandler)
 	mux.HandleFunc("/working_directory", workingDirectoryHandler)
 	mux.HandleFunc("/write_file", writeFileHandler)
+	mux.HandleFunc("/change_working_directory", changeWorkingDirectoryHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			logWarn("Invalid URL accessed: %s", r.URL.Path)
 			http.NotFound(w, r)
 			return
 		}
-		fmt.Fprintln(w, "PTY Automation Server running in keepalive mode. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /exec, /working_directory, /write_file")
+		fmt.Fprintln(w, "PTY Automation Server running in keepalive mode. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /exec, /working_directory, /write_file, /change_working_directory")
 	})
 
 	// Start HTTP server in background
