@@ -321,12 +321,19 @@ func ptyReader() {
 	logInfo("PTY reader goroutine exited.")
 }
 
-type OOBExecResponse struct {
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-	Error    string `json:"error,omitempty"`
-	Timeout  bool   `json:"timeout,omitempty"`
-	ExitCode int    `json:"exit_code"`
+type ExecRequest struct {
+	Args    []string `json:"args"`
+	Stdin   string   `json:"stdin,omitempty"`
+	Timeout int      `json:"timeout,omitempty"`
+}
+
+type ExecResponse struct {
+	Stdout           string `json:"stdout"`
+	Stderr           string `json:"stderr"`
+	Error            string `json:"error,omitempty"`
+	Timeout          bool   `json:"timeout,omitempty"`
+	ExitCode         int    `json:"exit_code"`
+	WorkingDirectory string `json:"working_directory"`
 }
 
 type WorkingDirectoryResponse struct {
@@ -618,69 +625,127 @@ func min(a, b int) int {
 	return b
 }
 
-// --- Out-of-band exec handler ---
-func oobExecHandler(w http.ResponseWriter, r *http.Request) {
+// --- Exec handler ---
+func execHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error": "POST required"}`, http.StatusMethodNotAllowed)
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, `{"error": "Failed to parse form data"}`, http.StatusBadRequest)
-		return
-	}
-	cmdStr := r.FormValue("cmd")
-	if cmdStr == "" {
-		http.Error(w, `{"error": "Missing 'cmd' in form data"}`, http.StatusBadRequest)
+
+	var req ExecRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error": "Failed to parse JSON request"}`, http.StatusBadRequest)
 		return
 	}
 
-	// Split command for exec.Command. Use "sh -c" for shell features.
-	cmd := exec.Command("sh", "-c", cmdStr)
-	// Set working directory to current directory of Go process (default)
-	// (No need to set cmd.Dir)
+	if len(req.Args) == 0 {
+		http.Error(w, `{"error": "Missing 'args' in request"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Set default timeout if not specified
+	timeout := req.Timeout
+	if timeout <= 0 {
+		timeout = 15
+	}
+	if timeout > 60 {
+		timeout = 60
+	}
+
+	// Get shell working directory
+	ptyRunningMu.Lock()
+	active := ptyRunning
+	ptyRunningMu.Unlock()
+
+	var shellWorkingDir string
+	if shellCmd != nil && shellCmd.Process != nil && active {
+		if shellCmd.ProcessState == nil || !shellCmd.ProcessState.Exited() {
+			pid := shellCmd.Process.Pid
+			if wd, err := getWorkingDirectory(pid); err == nil {
+				shellWorkingDir = wd
+			}
+		}
+	}
+
+	// Save current working directory of main process
+	originalWd, err := os.Getwd()
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(ExecResponse{
+			Error:            fmt.Sprintf("Failed to get current working directory: %v", err),
+			ExitCode:         -1,
+			WorkingDirectory: "",
+		})
+		return
+	}
+
+	// Change to shell working directory if available
+	if shellWorkingDir != "" {
+		if err := os.Chdir(shellWorkingDir); err != nil {
+			logWarn("Failed to change to shell working directory %s: %v", shellWorkingDir, err)
+			shellWorkingDir = originalWd
+		}
+	} else {
+		shellWorkingDir = originalWd
+	}
+
+	// Restore original working directory when done
+	defer func() {
+		if err := os.Chdir(originalWd); err != nil {
+			logError("Failed to restore original working directory %s: %v", originalWd, err)
+		}
+	}()
+
+	// Create command with array arguments
+	cmd := exec.Command(req.Args[0], req.Args[1:]...)
 
 	var stdoutBuf, stderrBuf strings.Builder
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
+
+	// Set stdin if provided
+	if req.Stdin != "" {
+		cmd.Stdin = strings.NewReader(req.Stdin)
+	}
 
 	done := make(chan error, 1)
 	go func() {
 		done <- cmd.Run()
 	}()
 
-	timeout := 10 * time.Second
-	var err error
+	timeoutDuration := time.Duration(timeout) * time.Second
+	var execErr error
 	var exitCode int
+	var timedOut bool
+
 	select {
-	case err = <-done:
+	case execErr = <-done:
 		if cmd.ProcessState != nil {
 			exitCode = cmd.ProcessState.ExitCode()
 		} else {
 			exitCode = -1
 		}
-	case <-time.After(timeout):
+	case <-time.After(timeoutDuration):
+		timedOut = true
 		_ = cmd.Process.Kill()
 		<-done // Wait for process to exit
 		exitCode = -1
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(OOBExecResponse{
-			Stdout:   stdoutBuf.String(),
-			Stderr:   stderrBuf.String(),
-			Error:    "timeout",
-			Timeout:  true,
-			ExitCode: exitCode,
-		})
-		return
 	}
 
-	resp := OOBExecResponse{
-		Stdout:   stdoutBuf.String(),
-		Stderr:   stderrBuf.String(),
-		ExitCode: exitCode,
+	resp := ExecResponse{
+		Stdout:           stdoutBuf.String(),
+		Stderr:           stderrBuf.String(),
+		ExitCode:         exitCode,
+		Timeout:          timedOut,
+		WorkingDirectory: shellWorkingDir,
 	}
-	if err != nil {
-		resp.Error = err.Error()
+
+	if timedOut {
+		resp.Error = "timeout"
+	} else if execErr != nil {
+		resp.Error = execErr.Error()
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -1002,7 +1067,7 @@ func main() {
 	mux.HandleFunc("/sendkeys_nowait", sendkeysNowaitHandler)
 	mux.HandleFunc("/sendkeys", sendkeysHandler)
 	mux.HandleFunc("/screen", screenHandler)
-	mux.HandleFunc("/oob_exec", oobExecHandler)
+	mux.HandleFunc("/exec", execHandler)
 	mux.HandleFunc("/working_directory", workingDirectoryHandler)
 	mux.HandleFunc("/write_file", writeFileHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -1012,7 +1077,7 @@ func main() {
 			return
 		}
 		// Could serve a simple help page or redirect
-		fmt.Fprintln(w, "PTY Automation Server running. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /oob_exec, /working_directory, /write_file")
+		fmt.Fprintln(w, "PTY Automation Server running. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /exec, /working_directory, /write_file")
 	})
 
 	// Attempt to set host TTY to a sane state
@@ -1031,6 +1096,7 @@ func main() {
 	logInfo("  POST /sendkeys_nowait (form data: {'keys': 'your_command\\n'})")
 	logInfo("  POST /sendkeys (form data: {'keys': 'your_command\\n'})")
 	logInfo("  GET  /screen")
+	logInfo("  POST /exec (JSON: {'args': ['cmd', 'arg1'], 'stdin': 'optional', 'timeout': 15})")
 	logInfo("  GET  /working_directory")
 	logInfo("  POST /write_file (form data: {'filename': 'path/to/file', 'content': 'file content'})")
 
@@ -1097,15 +1163,21 @@ func runMCPServer() {
 	)
 	s.AddTool(screenTool, screenToolHandler)
 
-	// Add oob_exec tool
-	oobExecTool := mcp.NewTool("oob_exec",
+	// Add exec tool
+	execTool := mcp.NewTool("exec",
 		mcp.WithDescription("Execute command out-of-band (not through terminal). Often used to monitor command execution, and other non-interactive tasks."),
-		mcp.WithString("cmd",
+		mcp.WithString("args",
 			mcp.Required(),
-			mcp.Description("Command to execute"),
+			mcp.Description("Command arguments as JSON array (e.g., '[\"ls\", \"-la\"]')"),
+		),
+		mcp.WithString("stdin",
+			mcp.Description("Optional stdin input for the command"),
+		),
+		mcp.WithNumber("timeout",
+			mcp.Description("Timeout in seconds (default: 15, max: 60)"),
 		),
 	)
-	s.AddTool(oobExecTool, oobExecToolHandler)
+	s.AddTool(execTool, execToolHandler)
 
 	// Add working_directory tool
 	workingDirectoryTool := mcp.NewTool("working_directory",
@@ -1261,7 +1333,7 @@ func screenToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.C
 	return mcp.NewToolResultText(result), nil
 }
 
-func oobExecToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func execToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// Check if Docker container is running
 	dockerMutex.Lock()
 	running := dockerRunning
@@ -1271,18 +1343,39 @@ func oobExecToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.
 		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
 	}
 
-	cmd, err := request.RequireString("cmd")
+	argsStr, err := request.RequireString("args")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	// Make REST call to /oob_exec endpoint
-	resp, err := makeOOBExecRequest(cmd)
+	// Parse args JSON array
+	var args []string
+	if err := json.Unmarshal([]byte(argsStr), &args); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Invalid args JSON: %v", err)), nil
+	}
+
+	if len(args) == 0 {
+		return mcp.NewToolResultError("args array cannot be empty"), nil
+	}
+
+	// Get optional stdin
+	stdin, _ := request.Params["stdin"].(string)
+
+	// Get optional timeout
+	timeout := 15
+	if timeoutVal, ok := request.Params["timeout"]; ok {
+		if timeoutFloat, ok := timeoutVal.(float64); ok {
+			timeout = int(timeoutFloat)
+		}
+	}
+
+	// Make REST call to /exec endpoint
+	resp, err := makeExecRequest(args, stdin, timeout)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to execute command: %v", err)), nil
 	}
 
-	result := fmt.Sprintf("Exit Code: %d", resp.ExitCode)
+	result := fmt.Sprintf("Exit Code: %d\nWorking Directory: %s", resp.ExitCode, resp.WorkingDirectory)
 	if resp.Stdout != "" {
 		result += fmt.Sprintf("\nStdout:\n%s", resp.Stdout)
 	}
@@ -1824,13 +1917,39 @@ func runCLIClient() {
 			printScreenResponse(resp)
 		}
 
-	case "oob-exec":
-		if len(cliArgs) != 1 {
-			fmt.Fprintf(os.Stderr, "Error: oob-exec requires exactly one argument (command)\n")
+	case "exec":
+		if len(cliArgs) < 1 {
+			fmt.Fprintf(os.Stderr, "Error: exec requires at least one argument (command)\n")
 			os.Exit(1)
 		}
-		cmd := cliArgs[0]
-		resp, err := makeCLIOOBExecRequest(baseURL, cmd)
+		
+		// Parse optional flags
+		args := cliArgs
+		stdin := ""
+		timeout := 15
+		
+		// Simple flag parsing - look for --stdin and --timeout
+		finalArgs := []string{}
+		for i := 0; i < len(args); i++ {
+			if args[i] == "--stdin" && i+1 < len(args) {
+				stdin = processEscapeSequences(args[i+1])
+				i++ // skip next arg
+			} else if args[i] == "--timeout" && i+1 < len(args) {
+				if t, err := strconv.Atoi(args[i+1]); err == nil {
+					timeout = t
+				}
+				i++ // skip next arg
+			} else {
+				finalArgs = append(finalArgs, args[i])
+			}
+		}
+		
+		if len(finalArgs) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: exec requires at least one command argument\n")
+			os.Exit(1)
+		}
+		
+		resp, err := makeCLIExecRequest(baseURL, finalArgs, stdin, timeout)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
@@ -1838,7 +1957,7 @@ func runCLIClient() {
 		if outputJSON {
 			printJSON(resp)
 		} else {
-			printOOBExecResponse(resp)
+			printExecResponse(resp)
 		}
 
 	case "working-directory":
@@ -1965,7 +2084,7 @@ func printScreenResponse(resp *ScreenResponse) {
 	fmt.Printf("🖱️  Cursor: (%d, %d) - %s\n", resp.Cursor.X, resp.Cursor.Y, cursorStatus)
 }
 
-func printOOBExecResponse(resp *OOBExecResponse) {
+func printExecResponse(resp *ExecResponse) {
 	if resp.Error != "" && resp.Error != "" {
 		fmt.Printf("❌ Error: %s\n", resp.Error)
 		return
@@ -1978,6 +2097,8 @@ func printOOBExecResponse(resp *OOBExecResponse) {
 	} else {
 		fmt.Printf("❌ Command failed with exit code: %d\n", resp.ExitCode)
 	}
+
+	fmt.Printf("📁 Working Directory: %s\n", resp.WorkingDirectory)
 
 	if resp.Stdout != "" {
 		fmt.Println("\n--- STDOUT ---")
@@ -2095,12 +2216,20 @@ func makeCLIScreenRequest(baseURL string) (*ScreenResponse, error) {
 	return &result, nil
 }
 
-func makeCLIOOBExecRequest(baseURL, cmd string) (*OOBExecResponse, error) {
-	data := url.Values{}
-	data.Set("cmd", cmd)
+func makeCLIExecRequest(baseURL string, args []string, stdin string, timeout int) (*ExecResponse, error) {
+	req := ExecRequest{
+		Args:    args,
+		Stdin:   stdin,
+		Timeout: timeout,
+	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.PostForm(baseURL+"/oob_exec", data)
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	client := &http.Client{Timeout: time.Duration(timeout+5) * time.Second}
+	resp, err := client.Post(baseURL+"/exec", "application/json", strings.NewReader(string(reqBody)))
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
@@ -2109,12 +2238,12 @@ func makeCLIOOBExecRequest(baseURL, cmd string) (*OOBExecResponse, error) {
 	// Check HTTP status code
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return &OOBExecResponse{
+		return &ExecResponse{
 			Error: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)),
 		}, nil
 	}
 
-	var result OOBExecResponse
+	var result ExecResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("failed to decode response: %w (body: %s)", err, string(body))
@@ -2211,18 +2340,26 @@ func makeCLIWriteFileRequest(baseURL, filename, content string) (*WriteFileRespo
 	return &result, nil
 }
 
-func makeOOBExecRequest(cmd string) (*OOBExecResponse, error) {
-	data := url.Values{}
-	data.Set("cmd", cmd)
+func makeExecRequest(args []string, stdin string, timeout int) (*ExecResponse, error) {
+	req := ExecRequest{
+		Args:    args,
+		Stdin:   stdin,
+		Timeout: timeout,
+	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.PostForm(mcpServerAddr+"/oob_exec", data)
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{Timeout: time.Duration(timeout+5) * time.Second}
+	resp, err := client.Post(mcpServerAddr+"/exec", "application/json", strings.NewReader(string(reqBody)))
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	var result OOBExecResponse
+	var result ExecResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
@@ -2265,7 +2402,7 @@ func runKeepaliveMode() {
 	mux.HandleFunc("/sendkeys_nowait", sendkeysNowaitHandler)
 	mux.HandleFunc("/sendkeys", sendkeysHandler)
 	mux.HandleFunc("/screen", screenHandler)
-	mux.HandleFunc("/oob_exec", oobExecHandler)
+	mux.HandleFunc("/exec", execHandler)
 	mux.HandleFunc("/working_directory", workingDirectoryHandler)
 	mux.HandleFunc("/write_file", writeFileHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -2274,7 +2411,7 @@ func runKeepaliveMode() {
 			http.NotFound(w, r)
 			return
 		}
-		fmt.Fprintln(w, "PTY Automation Server running in keepalive mode. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /oob_exec, /working_directory, /write_file")
+		fmt.Fprintln(w, "PTY Automation Server running in keepalive mode. Endpoints: /sendkeys_nowait, /sendkeys, /screen, /exec, /working_directory, /write_file")
 	})
 
 	// Start HTTP server in background
