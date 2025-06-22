@@ -1683,9 +1683,12 @@ func runMCPServer() {
 
 func sendkeysNowaitToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// Check if Docker container is running
+	logDebug("SENDKEYS_NOWAIT: Will lock dockerMutex to check running state")
 	dockerMutex.Lock()
+	logDebug("SENDKEYS_NOWAIT: Did lock dockerMutex")
 	running := dockerRunning
 	dockerMutex.Unlock()
+	logDebug("SENDKEYS_NOWAIT: Did unlock dockerMutex")
 
 	if !running {
 		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
@@ -1711,9 +1714,12 @@ func sendkeysNowaitToolHandler(ctx context.Context, request mcp.CallToolRequest)
 
 func sendkeysToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// Check if Docker container is running
+	logDebug("SENDKEYS: Will lock dockerMutex to check running state")
 	dockerMutex.Lock()
+	logDebug("SENDKEYS: Did lock dockerMutex")
 	running := dockerRunning
 	dockerMutex.Unlock()
+	logDebug("SENDKEYS: Did unlock dockerMutex")
 
 	if !running {
 		return mcp.NewToolResultError("Workspace not running. Please call 'begin' tool first."), nil
@@ -2013,13 +2019,16 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	logDebug("BEGIN: Starting begin tool handler")
 	
 	// Check if container is running and get cleanup info without holding lock
+	logDebug("BEGIN: Will lock dockerMutex to check container state")
 	dockerMutex.Lock()
+	logDebug("BEGIN: Did lock dockerMutex")
 	needsCleanup := dockerRunning
 	oldContainerID := dockerContainerID
 	oldCmd := dockerCmd
 	oldStdin := dockerStdin
 	oldKeepaliveDone := dockerKeepaliveDone
 	dockerMutex.Unlock()
+	logDebug("BEGIN: Did unlock dockerMutex")
 
 	// If container is already running, clean it up first
 	if needsCleanup {
@@ -2071,7 +2080,9 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 		}
 
 		// Reset state with lock
+		logDebug("BEGIN: Will lock dockerMutex to reset state")
 		dockerMutex.Lock()
+		logDebug("BEGIN: Did lock dockerMutex to reset state")
 		dockerRunning = false
 		dockerContainerID = ""
 		dockerHostPort = ""
@@ -2079,6 +2090,7 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 		dockerStdin = nil
 		dockerKeepaliveDone = nil
 		dockerMutex.Unlock()
+		logDebug("BEGIN: Did unlock dockerMutex after reset")
 
 		logInfo("BEGIN: Previous workspace cleaned up, proceeding with new workspace")
 	}
@@ -2197,7 +2209,9 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 
 	// Update global state with lock
 	logDebug("BEGIN: Updating global state")
+	logDebug("BEGIN: Will lock dockerMutex to update state")
 	dockerMutex.Lock()
+	logDebug("BEGIN: Did lock dockerMutex to update state")
 	dockerContainerID = containerID
 	dockerHostPort = hostPort
 	dockerRunning = true
@@ -2206,6 +2220,7 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	// Initialize keepalive done channel
 	dockerKeepaliveDone = make(chan struct{})
 	dockerMutex.Unlock()
+	logDebug("BEGIN: Did unlock dockerMutex after update")
 
 	// Update mcpServerAddr to use the new port
 	oldServerAddr := mcpServerAddr
@@ -2224,8 +2239,13 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 
 func saveWorkToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	logDebug("SAVE_WORK: Starting save_work tool handler")
+	logDebug("SAVE_WORK: Will lock dockerMutex")
 	dockerMutex.Lock()
-	defer dockerMutex.Unlock()
+	logDebug("SAVE_WORK: Did lock dockerMutex")
+	defer func() {
+		dockerMutex.Unlock()
+		logDebug("SAVE_WORK: Did unlock dockerMutex (deferred)")
+	}()
 
 	// Check if container is running
 	if !dockerRunning || dockerContainerID == "" {
@@ -2280,8 +2300,13 @@ func saveWorkToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp
 }
 
 func cleanupDockerContainer() {
+	logDebug("CLEANUP: Will lock dockerMutex")
 	dockerMutex.Lock()
-	defer dockerMutex.Unlock()
+	logDebug("CLEANUP: Did lock dockerMutex")
+	defer func() {
+		dockerMutex.Unlock()
+		logDebug("CLEANUP: Did unlock dockerMutex (deferred)")
+	}()
 
 	if dockerRunning {
 		logInfo("Cleaning up Docker container: %s", dockerContainerID)
@@ -3306,10 +3331,12 @@ func handleDockerKeepalive(stdout io.Reader, stdin io.Writer) {
 				default:
 				}
 
+				logDebug("KEEPALIVE: About to write pong to stdin")
 				if _, err := stdin.Write([]byte("pong\n")); err != nil {
 					logError("Failed to send pong to Docker container: %v", err)
 					return
 				}
+				logDebug("KEEPALIVE: Successfully wrote pong to stdin")
 			}
 		}
 	}()
@@ -3327,7 +3354,9 @@ func handleDockerKeepalive(stdout io.Reader, stdin io.Writer) {
 	}
 
 	// If we exit the keepalive handler due to stdout close, the container likely died
+	logDebug("KEEPALIVE: Will lock dockerMutex to mark container as not running")
 	dockerMutex.Lock()
+	logDebug("KEEPALIVE: Did lock dockerMutex")
 	if dockerRunning {
 		logWarn("Docker container communication lost, marking as not running")
 		dockerRunning = false
@@ -3340,4 +3369,5 @@ func handleDockerKeepalive(stdout io.Reader, stdin io.Writer) {
 		}
 	}
 	dockerMutex.Unlock()
+	logDebug("KEEPALIVE: Did unlock dockerMutex")
 }
