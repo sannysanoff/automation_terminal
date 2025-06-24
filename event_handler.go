@@ -67,13 +67,13 @@ const (
 type TermEventHandler struct {
 	mu sync.Mutex
 
-	screen   [][]ScreenCell
-	cursorX  int
-	cursorY  int
-	savedX   int
-	savedY   int
-	rows     int
-	cols     int
+	screen  [][]ScreenCell
+	cursorX int
+	cursorY int
+	savedX  int
+	savedY  int
+	rows    int
+	cols    int
 
 	// Current graphic rendition attributes
 	currentFgColor int
@@ -189,24 +189,24 @@ func (h *TermEventHandler) Print(b byte) error {
 		if line != "" || len(h.capturedLinesForSync) == 0 {
 			// Only add empty line if it's the first line (prompt)
 			h.capturedLinesForSync = append(h.capturedLinesForSync, line+"\n")
-			logDebug("EventHandler LineCapture LF: Appending CBL ('%s') to PLL. New PLL len: %d. Clearing CBL.", line, len(h.capturedLinesForSync))
+			//logDebug("EventHandler LineCapture LF: Appending CBL ('%s') to PLL. New PLL len: %d. Clearing CBL.", line, len(h.capturedLinesForSync))
 		}
 		h.lineBufferForCapture.Reset()
 	} else if char == '\r' {
 		// For CR, just reset buffer - we'll capture on LF
 		h.lineBufferForCapture.Reset()
-		logDebug("EventHandler LineCapture CR: Resetting CBL")
+		//logDebug("EventHandler LineCapture CR: Resetting CBL")
 	} else if char == '\b' { // Backspace
 		if h.lineBufferForCapture.Len() > 0 {
-			oldCBL := h.lineBufferForCapture.String()
+			//oldCBL := h.lineBufferForCapture.String()
 			// Simple truncate last byte. Assumes UTF-8 char is single byte or handled by terminal.
 			// For robust multi-byte backspace, would need to decode last rune.
 			h.lineBufferForCapture.Truncate(h.lineBufferForCapture.Len() - 1)
-			logDebug("EventHandler LineCapture BS: CBL was '%s', now '%s'", oldCBL, h.lineBufferForCapture.String())
+			//logDebug("EventHandler LineCapture BS: CBL was '%s', now '%s'", oldCBL, h.lineBufferForCapture.String())
 		}
 	} else if unicode.IsPrint(char) { // Check if it's printable
 		h.lineBufferForCapture.WriteRune(char)
-		logDebug("EventHandler LineCapture CHAR: Adding char '%s' to CBL. CBL now: '%s'", string(char), h.lineBufferForCapture.String())
+		//logDebug("EventHandler LineCapture CHAR: Adding char '%s' to CBL. CBL now: '%s'", string(char), h.lineBufferForCapture.String())
 	}
 	// End line capture logic
 
@@ -260,10 +260,10 @@ func (h *TermEventHandler) Execute(b byte) error {
 		line := h.lineBufferForCapture.String()
 		if line != "" || len(h.capturedLinesForSync) == 0 {
 			h.capturedLinesForSync = append(h.capturedLinesForSync, line+"\n")
-			logDebug(
-				"EventHandler LineCapture LF (Execute): Appending CBL ('%s') to PLL. New PLL len: %d. Clearing CBL.",
-				line, len(h.capturedLinesForSync),
-			)
+			//logDebug(
+			//	"EventHandler LineCapture LF (Execute): Appending CBL ('%s') to PLL. New PLL len: %d. Clearing CBL.",
+			//	line, len(h.capturedLinesForSync),
+			//)
 		}
 		h.lineBufferForCapture.Reset()
 		// —–– END line‐capture –––—
@@ -289,8 +289,8 @@ func (h *TermEventHandler) Execute(b byte) error {
 	case ansiterm.ANSI_CARRIAGE_RETURN: // Carriage Return (CR, 0x0D)
 		// just move cursor to column 0; don’t clear our capture buffer here
 		h.cursorX = 0
-	// SO, SI (Shift Out/In for character sets) - not handled for simple vt100/ansi
-	// Other C0 codes are typically ignored or have specific behaviors not emulated here.
+		// SO, SI (Shift Out/In for character sets) - not handled for simple vt100/ansi
+		// Other C0 codes are typically ignored or have specific behaviors not emulated here.
 	}
 	return nil
 }
@@ -303,7 +303,9 @@ func (h *TermEventHandler) CUU(param int) error {
 	if h.cursorY < h.scrollTop { // Or just < 0 if not respecting scroll region for this
 		h.cursorY = h.scrollTop
 	}
-	if h.cursorY < 0 { h.cursorY = 0} // Ensure within bounds
+	if h.cursorY < 0 {
+		h.cursorY = 0
+	} // Ensure within bounds
 	return nil
 }
 
@@ -315,7 +317,9 @@ func (h *TermEventHandler) CUD(param int) error {
 	if h.cursorY > h.scrollBottom { // Or just >= h.rows
 		h.cursorY = h.scrollBottom
 	}
-	if h.cursorY >= h.rows {h.cursorY = h.rows -1} // Ensure within bounds
+	if h.cursorY >= h.rows {
+		h.cursorY = h.rows - 1
+	} // Ensure within bounds
 	return nil
 }
 
@@ -345,8 +349,8 @@ func (h *TermEventHandler) CUB(param int) error {
 func (h *TermEventHandler) CNL(param int) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.CUD(param) // Move down N lines
-	h.cursorX = 0  // To start of line
+	h.CUD(param)  // Move down N lines
+	h.cursorX = 0 // To start of line
 	return nil
 }
 
@@ -354,8 +358,8 @@ func (h *TermEventHandler) CNL(param int) error {
 func (h *TermEventHandler) CPL(param int) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.CUU(param) // Move up N lines
-	h.cursorX = 0  // To start of line
+	h.CUU(param)  // Move up N lines
+	h.cursorX = 0 // To start of line
 	return nil
 }
 
@@ -597,8 +601,12 @@ func (h *TermEventHandler) DECSTBM(top, bottom int) error {
 	newTop := top - 1
 	newBottom := bottom - 1
 
-	if newTop < 0 { newTop = 0 }
-	if newBottom >= h.rows || newBottom == -1 { newBottom = h.rows -1 } // -1 from param can mean last line
+	if newTop < 0 {
+		newTop = 0
+	}
+	if newBottom >= h.rows || newBottom == -1 {
+		newBottom = h.rows - 1
+	} // -1 from param can mean last line
 
 	if newTop >= newBottom { // Invalid region usually resets to full screen
 		h.scrollTop = 0
@@ -647,10 +655,18 @@ func (h *TermEventHandler) DECRC() error {
 	h.cursorX = h.savedX
 	h.cursorY = h.savedY
 	// Clamp to bounds, though saved should be valid
-	if h.cursorY < 0 { h.cursorY = 0 }
-	if h.cursorY >= h.rows { h.cursorY = h.rows - 1 }
-	if h.cursorX < 0 { h.cursorX = 0 }
-	if h.cursorX >= h.cols { h.cursorX = h.cols - 1 }
+	if h.cursorY < 0 {
+		h.cursorY = 0
+	}
+	if h.cursorY >= h.rows {
+		h.cursorY = h.rows - 1
+	}
+	if h.cursorX < 0 {
+		h.cursorX = 0
+	}
+	if h.cursorX >= h.cols {
+		h.cursorX = h.cols - 1
+	}
 	return nil
 }
 
@@ -670,7 +686,6 @@ func (h *TermEventHandler) DECCOLM(use132 bool) error {
 
 // Flush is called by parser after Parse() finishes.
 func (h *TermEventHandler) Flush() error { return nil }
-
 
 // --- Methods for accessing screen state (used by /screen endpoint) ---
 
