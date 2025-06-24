@@ -126,9 +126,16 @@ func logDebug(format string, v ...interface{}) {
 			// Write to MCP log file with PID prefix
 			pid := os.Getpid()
 			logLine := fmt.Sprintf("[%d] DEBUG: "+format+"\n", append([]interface{}{pid}, v...)...)
-			mcpLogFile.WriteString(logLine)
-			mcpLogFile.Sync() // Ensure it's written immediately
+			if _, err := mcpLogFile.WriteString(logLine); err != nil {
+				// Log to standard logger if writing to mcpLogFile fails
+				log.Printf("ERROR: Failed to write to mcpLogFile: %v", err)
+			}
+			if err := mcpLogFile.Sync(); err != nil {
+				// Log to standard logger if sync fails
+                log.Printf("ERROR: Failed to sync mcpLogFile: %v", err)
+			}
 		}
+		// Also log to standard logger if verboseLoggingEnabled (even in MCP mode)
 		log.Printf("DEBUG: "+format, v...)
 	}
 }
@@ -263,63 +270,88 @@ func setupPtyAndShell() error {
 
 // --- PTY Reader Goroutine ---
 func ptyReader() {
-	defer close(ptyReaderDone)
-	logInfo("PTY reader goroutine started.")
+	logInfo("PTY_READER: Goroutine started.")
+	defer func() {
+		close(ptyReaderDone)
+		logInfo("PTY_READER: Goroutine finished and ptyReaderDone channel closed.")
+	}()
+
 	// Buffer for reading from PTY master
 	buf := make([]byte, 4096)
 
 	for {
 		ptyRunningMu.Lock()
-		if !ptyRunning {
-			ptyRunningMu.Unlock()
+		currentPtyRunningState := ptyRunning
+		ptyRunningMu.Unlock()
+
+		if !currentPtyRunningState {
+			logInfo("PTY_READER: ptyRunning is false, breaking loop.")
 			break
 		}
-		ptyRunningMu.Unlock()
 
 		// Set a deadline for reading to make the loop check ptyRunning periodically
 		// This also prevents Read from blocking indefinitely if ptyRunning is set to false.
 		if ptyMaster == nil { // ptyMaster might be closed by cleanup
-			logWarn("ptyMaster is nil in ptyReader loop, exiting.")
+			logWarn("PTY_READER: ptyMaster is nil in loop, exiting.")
 			break
 		}
-		ptyMaster.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		// logDebug("PTY_READER: Setting read deadline on ptyMaster.") // Too verbose for normal operation
+		if err := ptyMaster.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+            logWarn("PTY_READER: Error setting read deadline: %v. Continuing loop.", err)
+			// If setting deadline fails, we might get stuck in Read.
+			// However, the ptyRunning check should eventually break the loop if cleanup is called.
+			// Forcing an exit here might be too aggressive if it's a transient error.
+        }
 
+
+		// logDebug("PTY_READER: Attempting to read from ptyMaster.") // Too verbose
 		n, err := ptyMaster.Read(buf)
 		if err != nil {
 			if os.IsTimeout(err) { // Deadline exceeded
+				// logDebug("PTY_READER: Read timeout, continuing loop to check ptyRunning.") // Too verbose
 				continue // Loop back to check ptyRunning
 			}
 			// Handle other errors
-			if err == io.EOF {
-				logInfo("PTY EOF (shell exited), stopping reader goroutine.")
-			} else if strings.Contains(err.Error(), "input/output error") || strings.Contains(err.Error(), "file already closed") {
-				logWarn("PTY read error (FD likely closed by cleanup), stopping reader goroutine.")
+			logWarn("PTY_READER: Read error encountered.")
+			if errors.Is(err, io.EOF) {
+				logInfo("PTY_READER: EOF received (shell likely exited or PTY closed). Stopping reader.")
+			} else if strings.Contains(err.Error(), "input/output error") || strings.Contains(err.Error(), "file already closed") || strings.Contains(err.Error(), "bad file descriptor"){
+				logWarn("PTY_READER: PTY read error (FD likely closed by cleanup: '%v'). Stopping reader.", err)
 			} else {
-				logError("Error reading from PTY: %v", err)
+				logError("PTY_READER: Unhandled error reading from PTY: %v. Stopping reader.", err)
 			}
+
 			ptyRunningMu.Lock()
-			ptyRunning = false // Signal to stop
+			if ptyRunning { // Only change if it hasn't been changed by cleanup already
+				logInfo("PTY_READER: Setting ptyRunning to false due to read error.")
+				ptyRunning = false // Signal to stop
+			}
 			ptyRunningMu.Unlock()
-			break
+			break // Exit loop on error
 		}
 
 		if n > 0 {
 			data := buf[:n]
-			logDebug("PTY Read %d bytes: %q", n, string(data)) // Log raw bytes or a snippet
+			logDebug("PTY_READER: Read %d bytes: %q", n, string(data)) // Log raw bytes or a snippet
 
 			// Feed data to the AnsiParser
 			// The eventHandler (TermEventHandler) will update the screen model
 			// and also handle the line capture logic internally via its Print method.
 			if ansiParser != nil {
+				// logDebug("PTY_READER: Parsing %d bytes with ansiParser.", n) // Too verbose
 				_, parseErr := ansiParser.Parse(data)
 				if parseErr != nil {
-					logError("Error parsing ANSI stream: %v", parseErr)
+					logError("PTY_READER: Error parsing ANSI stream: %v", parseErr)
 					// Depending on severity, might want to stop or continue
 				}
+			} else {
+				logWarn("PTY_READER: ansiParser is nil, cannot parse output.")
 			}
+		} else {
+			// logDebug("PTY_READER: Read 0 bytes, no error. Looping.") // Can happen if deadline hits but no error
 		}
 	}
-	logInfo("PTY reader goroutine exited.")
+	logInfo("PTY_READER: Loop exited. Goroutine preparing to exit.")
 }
 
 type ExecRequest struct {
@@ -1282,82 +1314,115 @@ func shellescape(s string) string {
 
 // --- Cleanup Function ---
 func cleanup() {
-	logInfo("Initiating cleanup...")
+	logInfo("CLEANUP: Initiating cleanup...")
 	ptyRunningMu.Lock()
 	if !ptyRunning { // Already cleaned up or cleaning up
 		ptyRunningMu.Unlock()
-		logInfo("Cleanup already in progress or completed.")
+		logInfo("CLEANUP: Cleanup already in progress or completed.")
 		return
 	}
+	logInfo("CLEANUP: Setting ptyRunning to false.")
 	ptyRunning = false
 	ptyRunningMu.Unlock()
 
 	// Wait for PTY reader goroutine to finish
 	if ptyReaderDone != nil {
-		logInfo("Waiting for PTY reader goroutine to exit...")
+		logInfo("CLEANUP: Waiting for PTY reader goroutine to exit...")
 		select {
 		case <-ptyReaderDone:
-			logInfo("PTY reader goroutine exited gracefully.")
-		case <-time.After(1 * time.Second):
-			logWarn("PTY reader goroutine did not exit gracefully within timeout.")
+			logInfo("CLEANUP: PTY reader goroutine exited gracefully.")
+		case <-time.After(2 * time.Second): // Increased timeout slightly
+			logWarn("CLEANUP: PTY reader goroutine did not exit gracefully within 2s timeout.")
 		}
+	} else {
+		logInfo("CLEANUP: ptyReaderDone channel is nil.")
 	}
 
 	// Terminate the shell process and its children
 	if shellCmd != nil && shellCmd.Process != nil {
-		pgid, err := unix.Getpgid(shellCmd.Process.Pid)
-		if err == nil {
-			logInfo("Terminating shell process tree (PGID: %d)...", pgid)
-			// Send SIGTERM to the entire process group
-			if err := unix.Kill(-pgid, syscall.SIGTERM); err != nil {
-				logWarn("Failed to send SIGTERM to process group %d: %v", pgid, err)
-			} else {
-				// Wait for a short period for graceful termination
-				termWaitDone := make(chan error, 1)
-				go func() { termWaitDone <- shellCmd.Wait() }()
-				select {
-				case <-termWaitDone:
-					logInfo("Shell process group %d terminated gracefully.", pgid)
-				case <-time.After(2 * time.Second):
-					logWarn("Shell process group %d did not terminate gracefully with SIGTERM, sending SIGKILL...", pgid)
-					if err := unix.Kill(-pgid, syscall.SIGKILL); err != nil {
-						logError("Failed to send SIGKILL to process group %d: %v", pgid, err)
-					} else {
-						logInfo("Sent SIGKILL to process group %d.", pgid)
+		logInfo("CLEANUP: Shell command and process exist. PID: %d", shellCmd.Process.Pid)
+		if shellCmd.ProcessState != nil && shellCmd.ProcessState.Exited() {
+			logInfo("CLEANUP: Shell process PID %d has already exited.", shellCmd.Process.Pid)
+		} else {
+			pgid, err := unix.Getpgid(shellCmd.Process.Pid)
+			if err == nil {
+				logInfo("CLEANUP: Terminating shell process tree (PGID: %d)...", pgid)
+				// Send SIGTERM to the entire process group
+				logInfo("CLEANUP: Sending SIGTERM to PGID: %d", pgid)
+				if err := unix.Kill(-pgid, syscall.SIGTERM); err != nil {
+					logWarn("CLEANUP: Failed to send SIGTERM to process group %d: %v", pgid, err)
+				} else {
+					logInfo("CLEANUP: SIGTERM sent to PGID: %d. Waiting for termination...", pgid)
+					// Wait for a short period for graceful termination
+					termWaitDone := make(chan error, 1)
+					go func() {
+						logDebug("CLEANUP: Goroutine waiting for shellCmd.Wait() for PGID %d", pgid)
+						termWaitDone <- shellCmd.Wait()
+						logDebug("CLEANUP: shellCmd.Wait() completed for PGID %d", pgid)
+					}()
+					select {
+					case waitErr := <-termWaitDone:
+						if waitErr != nil {
+							logWarn("CLEANUP: Shell process group %d terminated with error: %v", pgid, waitErr)
+						} else {
+							logInfo("CLEANUP: Shell process group %d terminated gracefully after SIGTERM.", pgid)
+						}
+					case <-time.After(3 * time.Second): // Increased timeout
+						logWarn("CLEANUP: Shell process group %d did not terminate gracefully with SIGTERM after 3s, sending SIGKILL...", pgid)
+						if killErr := unix.Kill(-pgid, syscall.SIGKILL); killErr != nil {
+							logError("CLEANUP: Failed to send SIGKILL to process group %d: %v", pgid, killErr)
+						} else {
+							logInfo("CLEANUP: Sent SIGKILL to process group %d.", pgid)
+							// Optionally wait for SIGKILL to take effect
+							// go func() { termWaitDone <- shellCmd.Wait() }() // This might block if already exited
+							// select {
+							// case <-termWaitDone:
+							// 	logInfo("CLEANUP: Shell process group %d terminated after SIGKILL.", pgid)
+							// case <-time.After(1 * time.Second):
+							//  logWarn("CLEANUP: Shell process group %d did not confirm termination after SIGKILL.", pgid)
+							// }
+						}
 					}
 				}
+			} else { // getpgid failed
+				logWarn("CLEANUP: Failed to get PGID for shell process %d: %v. Attempting to kill process directly.", shellCmd.Process.Pid, err)
+				if err := shellCmd.Process.Kill(); err != nil {
+					logError("CLEANUP: Failed to kill shell process %d directly: %v", shellCmd.Process.Pid, err)
+				} else {
+					logInfo("CLEANUP: Shell process %d killed directly.", shellCmd.Process.Pid)
+				}
 			}
-		} else if shellCmd.ProcessState == nil || !shellCmd.ProcessState.Exited() {
-			// If getpgid fails, but process seems alive, try killing the process directly
-			logWarn("Failed to get PGID for shell process %d: %v. Attempting to kill process directly.", shellCmd.Process.Pid, err)
-			if err := shellCmd.Process.Kill(); err != nil {
-				logError("Failed to kill shell process %d: %v", shellCmd.Process.Pid, err)
-			}
-		} else {
-			logInfo("Shell process already exited or PGID not obtainable.")
 		}
 	} else {
-		logInfo("Shell process not running or already cleaned up.")
+		logInfo("CLEANUP: Shell process (shellCmd or shellCmd.Process) is nil or already cleaned up.")
 	}
+	logInfo("CLEANUP: Setting shellCmd to nil.")
 	shellCmd = nil
 
 	// Close PTY file descriptors
 	if ptyMaster != nil {
-		logInfo("Closing master PTY FD.")
+		logInfo("CLEANUP: Closing master PTY FD.")
 		if err := ptyMaster.Close(); err != nil {
-			logError("Error closing master PTY FD: %v", err)
+			logError("CLEANUP: Error closing master PTY FD: %v", err)
 		}
+		logInfo("CLEANUP: Setting ptyMaster to nil.")
 		ptyMaster = nil
-	}
-	if ptySlaveForTcgetpgrp != nil {
-		logInfo("Closing slave PTY FD (parent's copy).")
-		if err := ptySlaveForTcgetpgrp.Close(); err != nil {
-			logError("Error closing slave PTY FD: %v", err)
-		}
-		ptySlaveForTcgetpgrp = nil
+	} else {
+		logInfo("CLEANUP: ptyMaster is already nil.")
 	}
 
-	logInfo("Cleanup finished.")
+	if ptySlaveForTcgetpgrp != nil {
+		logInfo("CLEANUP: Closing slave PTY FD (parent's copy).")
+		if err := ptySlaveForTcgetpgrp.Close(); err != nil {
+			logError("CLEANUP: Error closing slave PTY FD: %v", err)
+		}
+		logInfo("CLEANUP: Setting ptySlaveForTcgetpgrp to nil.")
+		ptySlaveForTcgetpgrp = nil
+	} else {
+		logInfo("CLEANUP: ptySlaveForTcgetpgrp is already nil.")
+	}
+
+	logInfo("CLEANUP: Cleanup finished.")
 }
 
 // --- Main Application ---
@@ -1416,20 +1481,38 @@ func main() {
 
 		// Open MCP log file for debug output
 		var err error
-		mcpLogFile, err = os.OpenFile("/tmp/linux_terminal_mcp.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		mcpLogFilePath := "/tmp/linux_terminal_mcp.log"
+		logInfo("MAIN: Attempting to open MCP log file: %s", mcpLogFilePath)
+		mcpLogFile, err = os.OpenFile(mcpLogFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
-			logError("Failed to open MCP log file: %v", err)
+			logError("MAIN: Failed to open MCP log file '%s': %v. MCP debug logs will not be written to this file.", mcpLogFilePath, err)
+			// mcpLogFile will be nil, logDebug will handle it.
 		} else {
-			defer mcpLogFile.Close()
+			logInfo("MAIN: Successfully opened MCP log file: %s", mcpLogFilePath)
+			// Defer close only if successfully opened.
+			// The actual close will happen when main exits.
+			// If runMCPServer() is long-lived, this defer is fine.
+			defer func() {
+				logInfo("MAIN: Closing MCP log file: %s", mcpLogFilePath)
+				if err := mcpLogFile.Close(); err != nil {
+					logError("MAIN: Error closing MCP log file '%s': %v", mcpLogFilePath, err)
+				}
+			}()
+
 			// Write startup message with PID
 			pid := os.Getpid()
-			startupMsg := fmt.Sprintf("[%d] MCP mode started at %s\n", pid, time.Now().Format(time.RFC3339))
-			mcpLogFile.WriteString(startupMsg)
-			mcpLogFile.Sync()
+			startupMsg := fmt.Sprintf("[%d] MCP mode started at %s. Log file: %s\n", pid, time.Now().Format(time.RFC3339), mcpLogFilePath)
+			if _, writeErr := mcpLogFile.WriteString(startupMsg); writeErr != nil {
+				logError("MAIN: Failed to write startup message to MCP log file '%s': %v", mcpLogFilePath, writeErr)
+			}
+			if syncErr := mcpLogFile.Sync(); syncErr != nil {
+				logError("MAIN: Failed to sync MCP log file '%s' after startup message: %v", mcpLogFilePath, syncErr)
+			}
 		}
 
-		logInfo("Starting in MCP server mode, server address: %s", mcpServerAddr)
-		runMCPServer()
+		logInfo("MAIN: Starting in MCP server mode, server address for internal HTTP calls: %s", mcpServerAddr)
+		runMCPServer() // This function now contains its own lifecycle logging.
+		logInfo("MAIN: runMCPServer() has returned. MCP mode is terminating.")
 		return
 	}
 
@@ -1453,11 +1536,16 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	go func() {
 		sig := <-sigChan
-		logWarn("\nReceived signal: %s. Initiating shutdown sequence.", sig)
-		// cleanup() is deferred, so it will run.
+		logWarn("SIGNAL_HANDLER: Received signal: %s.", sig)
+		logInfo("SIGNAL_HANDLER: Initiating shutdown sequence due to signal %s.", sig)
+		// cleanup() is deferred, so it will run when os.Exit() is called.
 		// If server needs explicit shutdown:
-		// if httpServer != nil { httpServer.Shutdown(context.Background()) }
-		os.Exit(0) // Trigger deferred cleanup
+		// if httpServer != nil {
+		//    logInfo("SIGNAL_HANDLER: Shutting down HTTP server explicitly.")
+		//    httpServer.Shutdown(context.Background())
+		// }
+		logInfo("SIGNAL_HANDLER: Calling os.Exit(0) to trigger deferred cleanup and exit.")
+		os.Exit(0)
 	}()
 
 	// Setup and run Flask-like HTTP server
@@ -1529,9 +1617,20 @@ func runMCPServer() {
 
 	// Monitor for Docker death and exit with error
 	go func() {
-		<-dockerDied
-		logError("Docker container died, exiting MCP server with error code")
-		os.Exit(1)
+		logInfo("MCP_DOCKER_MONITOR: Goroutine started to monitor dockerDied channel.")
+		select {
+		case <-dockerDied:
+			logError("MCP_DOCKER_MONITOR: dockerDied channel closed, indicating the managed Docker container died unexpectedly.")
+			logWarn("MCP_DOCKER_MONITOR: This process will now exit abruptly with status 1 due to Docker container death.")
+			// Note: os.Exit(1) will prevent deferred functions in runMCPServer (like cleanupDockerContainer) from running.
+			// If cleanup is essential even in this scenario, this goroutine should instead signal mcpShutdown.
+			os.Exit(1)
+		case <-mcpShutdown:
+			logInfo("MCP_DOCKER_MONITOR: mcpShutdown signaled. Docker monitor goroutine exiting gracefully.")
+			// This case ensures the goroutine exits if the server is shutting down normally,
+			// preventing it from lingering or incorrectly triggering os.Exit(1) later if dockerDied closes during shutdown.
+		}
+		logInfo("MCP_DOCKER_MONITOR: Goroutine finished.")
 	}()
 
 	// Create a new MCP server
@@ -1663,22 +1762,45 @@ func runMCPServer() {
 	// Set up cleanup for Docker container on exit
 	defer cleanupDockerContainer()
 
+	logInfo("MCP_SERVER: Starting MCP server using server.ServeStdio.")
 	// Start the stdio server in a goroutine
 	serverDone := make(chan error, 1)
 	go func() {
-		serverDone <- server.ServeStdio(s)
+		logDebug("MCP_SERVER: Goroutine for server.ServeStdio started.")
+		err := server.ServeStdio(s)
+		logDebug("MCP_SERVER: server.ServeStdio returned an error: %v", err) // Will be nil on clean exit
+		serverDone <- err
+		logDebug("MCP_SERVER: Error from server.ServeStdio sent to serverDone channel.")
 	}()
 
+	logInfo("MCP_SERVER: Waiting for server.ServeStdio to complete or mcpShutdown signal.")
 	// Wait for either server completion or shutdown signal
 	select {
 	case err := <-serverDone:
-		if err != nil {
-			logError("MCP server error: %v", err)
+		if err != nil && !errors.Is(err, io.EOF) && !strings.Contains(err.Error(), "file already closed") {
+			// io.EOF or "file already closed" on stdin is expected when the client closes the connection or during shutdown.
+			logError("MCP_SERVER: Server.ServeStdio exited with error: %v", err)
+		} else if err != nil {
+			logInfo("MCP_SERVER: Server.ServeStdio exited with expected error (EOF or closed file): %v", err)
+		} else {
+			logInfo("MCP_SERVER: Server.ServeStdio exited gracefully (nil error).")
 		}
 	case <-mcpShutdown:
-		logInfo("MCP server shutting down gracefully")
-		// ServeStdio will exit when stdin closes, which happens during cleanup
+		logInfo("MCP_SERVER: mcpShutdown signal received. Initiating graceful shutdown of MCP server.")
+		// At this point, the MCP client (e.g. the host application) should close its stdin to this process.
+		// This will cause server.ServeStdio(s) to return, ideally with io.EOF.
+		// We wait for serverDone to confirm ServeStdio has exited.
+		logInfo("MCP_SERVER: Waiting for server.ServeStdio to exit after mcpShutdown signal...")
+		err := <-serverDone // Wait for the server goroutine to finish
+		if err != nil && !errors.Is(err, io.EOF) && !strings.Contains(err.Error(), "file already closed") {
+			logError("MCP_SERVER: Server.ServeStdio exited with error after shutdown signal: %v", err)
+		} else if err != nil {
+			logInfo("MCP_SERVER: Server.ServeStdio exited as expected after shutdown signal (EOF or closed file): %v", err)
+		} else {
+			logInfo("MCP_SERVER: Server.ServeStdio exited gracefully after shutdown signal (nil error).")
+		}
 	}
+	logInfo("MCP_SERVER: MCP server lifecycle concluded.")
 }
 
 func sendkeysNowaitToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -2010,184 +2132,240 @@ func replaceInFileToolHandler(ctx context.Context, request mcp.CallToolRequest) 
 }
 
 func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	logDebug("BEGIN: Starting begin tool handler")
+	logInfo("MCP_BEGIN: Tool handler started.")
 	dockerMutex.Lock()
 	defer dockerMutex.Unlock()
+	logDebug("MCP_BEGIN: Docker mutex acquired.")
 
 	// If container is already running, clean it up first
 	if dockerRunning {
-		logInfo("BEGIN: Existing workspace is running, closing it before starting new one")
-		logDebug("BEGIN: Container already running, cleaning up first")
+		logInfo("MCP_BEGIN: Existing Docker workspace is running (container ID: %s). Cleaning it up before starting a new one.", dockerContainerID)
 
 		// Signal keepalive handler to stop first
 		if dockerKeepaliveDone != nil {
-			logDebug("BEGIN: Signaling keepalive handler to stop")
+			logInfo("MCP_BEGIN: Signaling existing keepalive handler to stop.")
 			close(dockerKeepaliveDone)
-			dockerKeepaliveDone = nil
+			dockerKeepaliveDone = nil // Prevent double close
+		} else {
+			logInfo("MCP_BEGIN: No existing keepalive handler to stop (dockerKeepaliveDone is nil).")
 		}
 
 		// Close stdin to signal container to exit
 		if dockerStdin != nil {
-			logDebug("BEGIN: Closing Docker stdin")
-			dockerStdin.Close()
-			dockerStdin = nil
+			logInfo("MCP_BEGIN: Closing stdin of existing Docker container to signal it to exit.")
+			if err := dockerStdin.Close(); err != nil {
+				logWarn("MCP_BEGIN: Error closing existing Docker stdin: %v", err)
+			}
+			dockerStdin = nil // Prevent reuse
+		} else {
+			logInfo("MCP_BEGIN: No existing Docker stdin to close (dockerStdin is nil).")
 		}
 
 		// Wait for container process to exit or kill it
 		if dockerCmd != nil && dockerCmd.Process != nil {
+			logInfo("MCP_BEGIN: Waiting for existing Docker container process (PID: %d) to exit.", dockerCmd.Process.Pid)
 			done := make(chan error, 1)
 			go func() {
+				logDebug("MCP_BEGIN: Goroutine waiting for dockerCmd.Wait() for PID: %d", dockerCmd.Process.Pid)
 				done <- dockerCmd.Wait()
+				logDebug("MCP_BEGIN: dockerCmd.Wait() completed for PID: %d", dockerCmd.Process.Pid)
 			}()
 
 			select {
 			case err := <-done:
 				if err != nil {
-					logWarn("BEGIN: Previous Docker container exited with error: %v", err)
+					logWarn("MCP_BEGIN: Previous Docker container (PID: %d) exited with error: %v", dockerCmd.Process.Pid, err)
 				} else {
-					logInfo("BEGIN: Previous Docker container exited gracefully")
+					logInfo("MCP_BEGIN: Previous Docker container (PID: %d) exited gracefully.", dockerCmd.Process.Pid)
 				}
 			case <-time.After(5 * time.Second):
-				logWarn("BEGIN: Previous Docker container did not exit gracefully, killing process")
-				dockerCmd.Process.Kill()
+				logWarn("MCP_BEGIN: Previous Docker container (PID: %d) did not exit gracefully after 5s, killing process.", dockerCmd.Process.Pid)
+				if err := dockerCmd.Process.Kill(); err != nil {
+					logError("MCP_BEGIN: Failed to kill previous Docker process (PID: %d): %v", dockerCmd.Process.Pid, err)
+				} else {
+					logInfo("MCP_BEGIN: Previous Docker process (PID: %d) killed.", dockerCmd.Process.Pid)
+				}
 				<-done // Wait for process to be killed
+				logInfo("MCP_BEGIN: Previous Docker process (PID: %d) confirmed killed.", dockerCmd.Process.Pid)
 			}
 			dockerCmd = nil
+		} else {
+			logInfo("MCP_BEGIN: No existing Docker command/process to wait for (dockerCmd or dockerCmd.Process is nil).")
 		}
 
-		// Stop the container if it's still running
+		// Stop the container if it's still running (e.g. if docker start -ai was not used or process detached)
 		if dockerContainerID != "" {
-			logInfo("BEGIN: Stopping previous Docker container: %s", dockerContainerID)
-			stopCmd := exec.Command("docker", "stop", dockerContainerID)
-			if err := stopCmd.Run(); err != nil {
-				logWarn("BEGIN: Failed to stop previous Docker container %s: %v", dockerContainerID, err)
+			logInfo("MCP_BEGIN: Attempting to stop previous Docker container by ID: %s", dockerContainerID)
+			stopCmdArgs := []string{"docker", "stop", dockerContainerID}
+			logDebug("MCP_BEGIN: Executing: %v", stopCmdArgs)
+			stopCmd := exec.Command(stopCmdArgs[0], stopCmdArgs[1:]...)
+			if output, err := stopCmd.CombinedOutput(); err != nil {
+				logWarn("MCP_BEGIN: Failed to stop previous Docker container %s: %v. Output: %s", dockerContainerID, err, string(output))
 			} else {
-				logInfo("BEGIN: Previous Docker container %s stopped successfully", dockerContainerID)
+				logInfo("MCP_BEGIN: Previous Docker container %s stopped successfully. Output: %s", dockerContainerID, string(output))
 			}
 		}
 
 		// Reset state
+		logInfo("MCP_BEGIN: Resetting Docker state variables.")
 		dockerRunning = false
-		dockerContainerID = ""
-		dockerHostPort = ""
+		dockerContainerID = "" // Will be set by new container
+		dockerHostPort = ""    // Will be set by new container
 
-		logInfo("BEGIN: Previous workspace cleaned up, proceeding with new workspace")
+		logInfo("MCP_BEGIN: Previous workspace cleanup complete. Proceeding to create new workspace.")
+	} else {
+		logInfo("MCP_BEGIN: No existing Docker workspace running. Proceeding to create a new one.")
 	}
 
 	// Get image ID (optional parameter)
-	imageID := "sannysanoff/automation_terminal"
-	if id, err := request.RequireString("workspace_id"); err == nil && id != "" {
-		imageID = id
-		logDebug("BEGIN: Using custom image ID: %s", imageID)
+	imageID := "sannysanoff/automation_terminal" // Default image
+	workspaceID, err := request.GetString("workspace_id")
+	if err == nil && workspaceID != "" {
+		imageID = workspaceID
+		logInfo("MCP_BEGIN: Using custom workspace_id as image: %s", imageID)
 	} else {
-		logDebug("BEGIN: Using default image ID: %s", imageID)
+		logInfo("MCP_BEGIN: Using default image: %s (workspace_id not provided or error: %v)", imageID, err)
 	}
 
 	// Create Docker container first to get container ID
-	logInfo("Creating Docker container with image: %s", imageID)
-	logDebug("BEGIN: Creating docker create command")
-	createCmd := exec.Command("docker", "create", "-it", "-p", ":5399", "-e", "KEEPALIVE=true", imageID)
-	logDebug("BEGIN: Docker create command: %v", createCmd.Args)
+	logInfo("MCP_BEGIN: Creating Docker container with image: %s", imageID)
+	createCmdArgs := []string{"docker", "create", "-it", "-p", ":5399", "-e", "KEEPALIVE=true", imageID}
+	logDebug("MCP_BEGIN: Docker create command: %v", createCmdArgs)
+	createCmd := exec.Command(createCmdArgs[0], createCmdArgs[1:]...)
 
-	logDebug("BEGIN: Executing docker create")
 	createOutput, err := createCmd.Output()
 	if err != nil {
-		logDebug("BEGIN: Failed to create Docker container: %v", err)
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to create Docker container: %v", err)), nil
+		errMsg := fmt.Sprintf("Failed to create Docker container with image %s: %v. Output: %s", imageID, err, string(createOutput))
+		logError("MCP_BEGIN: %s", errMsg)
+		// Attempt to pull the image if create failed, as it might not exist locally
+		logInfo("MCP_BEGIN: Attempting to pull Docker image %s as create failed.", imageID)
+		pullCmdArgs := []string{"docker", "pull", imageID}
+		logDebug("MCP_BEGIN: Docker pull command: %v", pullCmdArgs)
+		pullCmd := exec.Command(pullCmdArgs[0], pullCmdArgs[1:]...)
+		if pullOutput, pullErr := pullCmd.CombinedOutput(); pullErr != nil {
+			logError("MCP_BEGIN: Failed to pull Docker image %s: %v. Output: %s", imageID, pullErr, string(pullOutput))
+			// Return original create error
+			return mcp.NewToolResultError(errMsg + fmt.Sprintf(" | Pull attempt also failed: %v. Output: %s", pullErr, string(pullOutput))), nil
+		}
+		logInfo("MCP_BEGIN: Successfully pulled Docker image %s. Retrying create...", imageID)
+		// Retry create
+		createOutput, err = createCmd.Output() // Re-run the same createCmd
+		if err != nil {
+			errMsgRetry := fmt.Sprintf("Failed to create Docker container with image %s even after pull: %v. Output: %s", imageID, err, string(createOutput))
+			logError("MCP_BEGIN: %s", errMsgRetry)
+			return mcp.NewToolResultError(errMsgRetry), nil
+		}
+		logInfo("MCP_BEGIN: Docker container created successfully after image pull.")
 	}
 
 	containerID := strings.TrimSpace(string(createOutput))
-	logDebug("BEGIN: Created container ID: %s", containerID)
+	logInfo("MCP_BEGIN: Created Docker container ID: %s", containerID)
 	if containerID == "" {
-		logDebug("BEGIN: Docker create returned empty container ID")
-		return mcp.NewToolResultError("Docker create command returned empty container ID"), nil
+		errMsg := "Docker create command returned empty container ID."
+		logError("MCP_BEGIN: %s", errMsg)
+		return mcp.NewToolResultError(errMsg), nil
 	}
 
 	// Now start the container interactively
-	logInfo("Starting Docker container with ID: %s", containerID)
-	logDebug("BEGIN: Creating docker start command")
-	cmd := exec.Command("docker", "start", "-ai", containerID)
-	logDebug("BEGIN: Docker start command: %v", cmd.Args)
+	logInfo("MCP_BEGIN: Starting Docker container with ID: %s", containerID)
+	startCmdArgs := []string{"docker", "start", "-ai", containerID}
+	logDebug("MCP_BEGIN: Docker start command: %v", startCmdArgs)
+	cmd := exec.Command(startCmdArgs[0], startCmdArgs[1:]...)
 
 	// Get stdin pipe to send pong responses
-	logDebug("BEGIN: Getting stdin pipe for Docker container")
+	logInfo("MCP_BEGIN: Getting stdin pipe for Docker container %s.", containerID)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		logDebug("BEGIN: Failed to get stdin pipe: %v", err)
-		// Clean up the created container
-		exec.Command("docker", "rm", containerID).Run()
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to get stdin pipe: %v", err)), nil
+		errMsg := fmt.Sprintf("Failed to get stdin pipe for container %s: %v", containerID, err)
+		logError("MCP_BEGIN: %s", errMsg)
+		// Clean up the created container as we can't interact with it
+		logWarn("MCP_BEGIN: Attempting to remove container %s due to stdin pipe failure.", containerID)
+		exec.Command("docker", "rm", "-f", containerID).Run() // Force remove
+		return mcp.NewToolResultError(errMsg), nil
 	}
+	logDebug("MCP_BEGIN: Stdin pipe obtained for %s.", containerID)
 
 	// Get stdout pipe to read ping messages
-	logDebug("BEGIN: Getting stdout pipe for Docker container")
+	logInfo("MCP_BEGIN: Getting stdout pipe for Docker container %s.", containerID)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		logDebug("BEGIN: Failed to get stdout pipe: %v", err)
-		stdin.Close()
-		// Clean up the created container
-		exec.Command("docker", "rm", containerID).Run()
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to get stdout pipe: %v", err)), nil
+		errMsg := fmt.Sprintf("Failed to get stdout pipe for container %s: %v", containerID, err)
+		logError("MCP_BEGIN: %s", errMsg)
+		stdin.Close() // Close the stdin pipe we got
+		logWarn("MCP_BEGIN: Attempting to remove container %s due to stdout pipe failure.", containerID)
+		exec.Command("docker", "rm", "-f", containerID).Run() // Force remove
+		return mcp.NewToolResultError(errMsg), nil
 	}
+	logDebug("MCP_BEGIN: Stdout pipe obtained for %s.", containerID)
 
 	// Start the container
-	logDebug("BEGIN: Starting Docker container")
+	logInfo("MCP_BEGIN: Executing cmd.Start() for container %s.", containerID)
 	if err := cmd.Start(); err != nil {
-		logDebug("BEGIN: Failed to start Docker container: %v", err)
+		errMsg := fmt.Sprintf("Failed to start Docker container %s: %v", containerID, err)
+		logError("MCP_BEGIN: %s", errMsg)
 		stdin.Close()
-		// Clean up the created container
-		exec.Command("docker", "rm", containerID).Run()
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to start Docker container: %v", err)), nil
+		stdout.Close() // Should be closed by cmd.Start() failure, but good practice
+		logWarn("MCP_BEGIN: Attempting to remove container %s due to start failure.", containerID)
+		exec.Command("docker", "rm", "-f", containerID).Run() // Force remove
+		return mcp.NewToolResultError(errMsg), nil
 	}
 
-	logInfo("Docker container started with PID: %d", cmd.Process.Pid)
-	logDebug("BEGIN: Docker container started successfully with PID: %d", cmd.Process.Pid)
+	logInfo("MCP_BEGIN: Docker container %s started successfully with PID: %d.", containerID, cmd.Process.Pid)
 
-	// Wait a moment for container to start
-	logDebug("BEGIN: Waiting 2 seconds for container to initialize")
-	time.Sleep(2 * time.Second)
+	// Wait a moment for container to start and initialize its internal server
+	logInfo("MCP_BEGIN: Waiting 3 seconds for container %s to initialize...", containerID)
+	time.Sleep(3 * time.Second)
 
 	// Get port mapping
-	logDebug("BEGIN: Inspecting container ports for container: %s", containerID)
-	inspectCmd := exec.Command("docker", "inspect", "--format={{json .NetworkSettings.Ports}}", containerID)
-	logDebug("BEGIN: Running command: %v", inspectCmd.Args)
-	portOutput, err := inspectCmd.Output()
+	logInfo("MCP_BEGIN: Inspecting container ports for container: %s", containerID)
+	inspectCmdArgs := []string{"docker", "inspect", "--format={{json .NetworkSettings.Ports}}", containerID}
+	logDebug("MCP_BEGIN: Running command: %v", inspectCmdArgs)
+	inspectCmd := exec.Command(inspectCmdArgs[0], inspectCmdArgs[1:]...)
+	portOutput, err := inspectCmd.Output() // Using Output to get stdout
 	if err != nil {
-		logDebug("BEGIN: Failed to inspect Docker container ports: %v", err)
-		cmd.Process.Kill()
+		errMsg := fmt.Sprintf("Failed to inspect Docker container %s ports: %v. Output: %s", containerID, err, string(portOutput))
+		logError("MCP_BEGIN: %s", errMsg)
+		cmd.Process.Kill() // Kill the container process
 		stdin.Close()
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to inspect Docker container ports: %v", err)), nil
+		// stdout is likely closed by process kill
+		logWarn("MCP_BEGIN: Attempting to remove container %s due to inspect failure.", containerID)
+		exec.Command("docker", "rm", "-f", containerID).Run() // Force remove
+		return mcp.NewToolResultError(errMsg), nil
 	}
 
-	logDebug("BEGIN: Port inspection output: %s", string(portOutput))
-	// Parse port mapping JSON
+	logDebug("MCP_BEGIN: Port inspection output for %s: %s", containerID, string(portOutput))
 	var ports map[string][]map[string]string
 	if err := json.Unmarshal(portOutput, &ports); err != nil {
-		logDebug("BEGIN: Failed to parse port mapping JSON: %v", err)
+		errMsg := fmt.Sprintf("Failed to parse port mapping JSON for %s: %v. JSON: %s", containerID, err, string(portOutput))
+		logError("MCP_BEGIN: %s", errMsg)
 		cmd.Process.Kill()
 		stdin.Close()
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to parse port mapping JSON: %v", err)), nil
+		logWarn("MCP_BEGIN: Attempting to remove container %s due to port JSON parse failure.", containerID)
+		exec.Command("docker", "rm", "-f", containerID).Run() // Force remove
+		return mcp.NewToolResultError(errMsg), nil
 	}
 
-	logDebug("BEGIN: Parsed ports: %+v", ports)
-	// Extract host port for 5399/tcp
+	logDebug("MCP_BEGIN: Parsed ports for %s: %+v", containerID, ports)
 	hostPort := ""
 	if tcpPorts, exists := ports["5399/tcp"]; exists && len(tcpPorts) > 0 {
 		hostPort = tcpPorts[0]["HostPort"]
-		logDebug("BEGIN: Found host port: %s", hostPort)
+		logInfo("MCP_BEGIN: Found host port for 5399/tcp on container %s: %s", containerID, hostPort)
 	} else {
-		logDebug("BEGIN: No port mapping found for 5399/tcp")
+		logWarn("MCP_BEGIN: No port mapping found for 5399/tcp on container %s.", containerID)
 	}
 
 	if hostPort == "" {
-		logDebug("BEGIN: Host port is empty, killing process")
+		errMsg := fmt.Sprintf("Host port for 5399/tcp is empty for container %s. Killing process.", containerID)
+		logError("MCP_BEGIN: %s", errMsg)
 		cmd.Process.Kill()
 		stdin.Close()
-		return mcp.NewToolResultError("Failed to find host port mapping for 5399/tcp"), nil
+		logWarn("MCP_BEGIN: Attempting to remove container %s due to missing host port.", containerID)
+		exec.Command("docker", "rm", "-f", containerID).Run() // Force remove
+		return mcp.NewToolResultError(errMsg), nil
 	}
 
 	// Update global state
-	logDebug("BEGIN: Updating global state")
+	logInfo("MCP_BEGIN: Updating global Docker state. Container ID: %s, Host Port: %s", containerID, hostPort)
 	dockerContainerID = containerID
 	dockerHostPort = hostPort
 	dockerRunning = true
@@ -2197,136 +2375,183 @@ func beginToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 	// Update mcpServerAddr to use the new port
 	oldServerAddr := mcpServerAddr
 	mcpServerAddr = fmt.Sprintf("http://localhost:%s", hostPort)
-	logDebug("BEGIN: Updated server address from %s to %s", oldServerAddr, mcpServerAddr)
+	logInfo("MCP_BEGIN: Updated internal mcpServerAddr from %s to %s", oldServerAddr, mcpServerAddr)
 
 	// Initialize keepalive done channel
+	logDebug("MCP_BEGIN: Initializing dockerKeepaliveDone channel.")
 	dockerKeepaliveDone = make(chan struct{})
 
 	// Start goroutine to handle ping/pong communication
-	logDebug("BEGIN: Starting Docker keepalive handler goroutine")
-	go handleDockerKeepalive(stdout, stdin)
+	logInfo("MCP_BEGIN: Starting Docker keepalive handler goroutine for container %s.", containerID)
+	go handleDockerKeepalive(stdout, stdin) // stdin here is the pipe to the container
 
-	logInfo("Docker container ready. Host port: %s, Container ID: %s", hostPort, containerID)
-	logDebug("BEGIN: Workspace setup completed successfully")
+	logInfo("MCP_BEGIN: Docker container %s ready. Host port: %s. Workspace setup completed successfully.", containerID, hostPort)
 
-	return mcp.NewToolResultText("Workspace started successfully!"), nil
+	return mcp.NewToolResultText(fmt.Sprintf("Workspace started successfully! Container ID: %s, Mapped Port: %s", containerID, hostPort)), nil
 }
 
 func saveWorkToolHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	logDebug("SAVE_WORK: Starting save_work tool handler")
+	logInfo("MCP_SAVE_WORK: Starting save_work tool handler.")
 	dockerMutex.Lock()
 	defer dockerMutex.Unlock()
+	logDebug("MCP_SAVE_WORK: Docker mutex acquired.")
 
 	// Check if container is running
 	if !dockerRunning || dockerContainerID == "" {
-		logDebug("SAVE_WORK: No workspace running (dockerRunning=%t, containerID='%s')", dockerRunning, dockerContainerID)
-		return mcp.NewToolResultError("No workspace is running. Please call 'begin' tool first."), nil
+		errMsg := fmt.Sprintf("No workspace running (dockerRunning=%t, containerID='%s'). Please call 'begin' tool first.", dockerRunning, dockerContainerID)
+		logWarn("MCP_SAVE_WORK: %s", errMsg)
+		return mcp.NewToolResultError(errMsg), nil
 	}
 
-	logDebug("SAVE_WORK: Workspace is running, container ID: %s", dockerContainerID)
+	logInfo("MCP_SAVE_WORK: Workspace is running. Container ID: %s", dockerContainerID)
 
 	comment, err := request.RequireString("comment")
 	if err != nil {
-		logDebug("SAVE_WORK: Failed to get comment parameter: %v", err)
-		return mcp.NewToolResultError(err.Error()), nil
+		errMsg := fmt.Sprintf("Failed to get 'comment' parameter: %v", err)
+		logError("MCP_SAVE_WORK: %s", errMsg)
+		return mcp.NewToolResultError(errMsg), nil
 	}
 
-	logDebug("SAVE_WORK: Commit comment: '%s'", comment)
+	logInfo("MCP_SAVE_WORK: Commit comment: '%s'", comment)
 
 	// Commit the container
-	logInfo("Committing Docker container %s with message: %s", dockerContainerID, comment)
-	logDebug("SAVE_WORK: Creating docker commit command")
-	commitCmd := exec.Command("docker", "commit", "-m", comment, dockerContainerID)
-	logDebug("SAVE_WORK: Docker commit command: %v", commitCmd.Args)
+	logInfo("MCP_SAVE_WORK: Committing Docker container %s with message: \"%s\"", dockerContainerID, comment)
+	commitCmdArgs := []string{"docker", "commit", "-m", comment, dockerContainerID}
+	logDebug("MCP_SAVE_WORK: Docker commit command: %v", commitCmdArgs)
+	commitCmd := exec.Command(commitCmdArgs[0], commitCmdArgs[1:]...)
 
-	logDebug("SAVE_WORK: Executing docker commit")
-	output, err := commitCmd.Output()
+	output, err := commitCmd.Output() // Using Output to get the image ID
 	if err != nil {
-		logDebug("SAVE_WORK: Docker commit failed: %v", err)
-		return mcp.NewToolResultError(fmt.Sprintf("Failed to commit Docker container: %v", err)), nil
+		errMsg := fmt.Sprintf("Failed to commit Docker container %s: %v. Output: %s", dockerContainerID, err, string(output))
+		logError("MCP_SAVE_WORK: %s", errMsg)
+		return mcp.NewToolResultError(errMsg), nil
 	}
 
-	logDebug("SAVE_WORK: Docker commit output: '%s'", string(output))
-	imageID := strings.TrimSpace(string(output))
-	if imageID == "" {
-		logDebug("SAVE_WORK: Docker commit returned empty image ID")
-		return mcp.NewToolResultError("Docker commit command returned empty image ID"), nil
+	imageIDWithPrefix := strings.TrimSpace(string(output))
+	logInfo("MCP_SAVE_WORK: Docker commit successful for %s. Raw Image ID from commit: '%s'", dockerContainerID, imageIDWithPrefix)
+
+	if imageIDWithPrefix == "" {
+		errMsg := fmt.Sprintf("Docker commit for container %s returned empty image ID.", dockerContainerID)
+		logError("MCP_SAVE_WORK: %s", errMsg)
+		return mcp.NewToolResultError(errMsg), nil
 	}
 
 	// Remove "sha256:" prefix if present
+	imageID := imageIDWithPrefix
 	if strings.HasPrefix(imageID, "sha256:") {
 		imageID = strings.TrimPrefix(imageID, "sha256:")
+		logDebug("MCP_SAVE_WORK: Removed 'sha256:' prefix. Image ID now: '%s'", imageID)
 	}
 
-	// Shorten hash to first 12 characters
-	if len(imageID) > 12 {
-		imageID = imageID[:12]
+	// Shorten hash to first 12 characters for display, but return full ID if needed by platform
+	displayImageID := imageID
+	if len(displayImageID) > 12 {
+		displayImageID = displayImageID[:12]
+		logDebug("MCP_SAVE_WORK: Shortened image ID for display to: '%s'", displayImageID)
 	}
 
-	logInfo("Docker container committed successfully. New image ID: %s", imageID)
-	logDebug("SAVE_WORK: Successfully committed container, new image ID: %s", imageID)
-
-	return mcp.NewToolResultText(fmt.Sprintf("Work saved, New Workspace Id: %s", imageID)), nil
+	logInfo("MCP_SAVE_WORK: Docker container %s committed successfully. New image ID (display): %s, (full from commit): %s", dockerContainerID, displayImageID, imageIDWithPrefix)
+	// The platform might expect the full sha256 prefixed ID or just the hash.
+	// For now, returning the potentially shortened hash as per previous logic, but logging the full one.
+	// Consider what `mcp.CallToolResult` expects for "New Workspace Id".
+	// Returning the shortened ID as per the original logic for now.
+	return mcp.NewToolResultText(fmt.Sprintf("Work saved, New Workspace Id: %s", displayImageID)), nil
 }
 
 func cleanupDockerContainer() {
+	logInfo("MCP_CLEANUP_DOCKER: Initiating Docker container cleanup.")
 	dockerMutex.Lock()
 	defer dockerMutex.Unlock()
+	logDebug("MCP_CLEANUP_DOCKER: Docker mutex acquired.")
 
 	if dockerRunning {
-		logInfo("Cleaning up Docker container: %s", dockerContainerID)
+		logInfo("MCP_CLEANUP_DOCKER: Docker is running. Container ID: %s", dockerContainerID)
 
 		// Signal keepalive handler to stop first
 		if dockerKeepaliveDone != nil {
-			logDebug("Signaling keepalive handler to stop")
+			logInfo("MCP_CLEANUP_DOCKER: Signaling keepalive handler to stop for container %s.", dockerContainerID)
 			close(dockerKeepaliveDone)
-			dockerKeepaliveDone = nil
+			dockerKeepaliveDone = nil // Avoid double close
+		} else {
+			logInfo("MCP_CLEANUP_DOCKER: No keepalive handler to stop (dockerKeepaliveDone is nil) for container %s.", dockerContainerID)
 		}
 
 		// Close stdin to signal container to exit
 		if dockerStdin != nil {
-			logDebug("Closing Docker stdin")
-			dockerStdin.Close()
-			dockerStdin = nil
+			logInfo("MCP_CLEANUP_DOCKER: Closing stdin of Docker container %s to signal it to exit.", dockerContainerID)
+			if err := dockerStdin.Close(); err != nil {
+				logWarn("MCP_CLEANUP_DOCKER: Error closing Docker stdin for container %s: %v", dockerContainerID, err)
+			}
+			dockerStdin = nil // Prevent reuse
+		} else {
+			logInfo("MCP_CLEANUP_DOCKER: No Docker stdin to close (dockerStdin is nil) for container %s.", dockerContainerID)
 		}
 
 		// Wait for container process to exit or kill it
 		if dockerCmd != nil && dockerCmd.Process != nil {
+			logInfo("MCP_CLEANUP_DOCKER: Waiting for Docker container process (PID: %d, Container: %s) to exit.", dockerCmd.Process.Pid, dockerContainerID)
 			done := make(chan error, 1)
 			go func() {
+				logDebug("MCP_CLEANUP_DOCKER: Goroutine waiting for dockerCmd.Wait() for PID %d (Container %s)", dockerCmd.Process.Pid, dockerContainerID)
 				done <- dockerCmd.Wait()
+				logDebug("MCP_CLEANUP_DOCKER: dockerCmd.Wait() completed for PID %d (Container %s)", dockerCmd.Process.Pid, dockerContainerID)
 			}()
 
 			select {
 			case err := <-done:
 				if err != nil {
-					logWarn("Docker container exited with error: %v", err)
+					logWarn("MCP_CLEANUP_DOCKER: Docker container process (PID: %d, Container: %s) exited with error: %v", dockerCmd.Process.Pid, dockerContainerID, err)
 				} else {
-					logInfo("Docker container exited gracefully")
+					logInfo("MCP_CLEANUP_DOCKER: Docker container process (PID: %d, Container: %s) exited gracefully.", dockerCmd.Process.Pid, dockerContainerID)
 				}
 			case <-time.After(5 * time.Second):
-				logWarn("Docker container did not exit gracefully, killing process")
-				dockerCmd.Process.Kill()
+				logWarn("MCP_CLEANUP_DOCKER: Docker container process (PID: %d, Container: %s) did not exit gracefully after 5s, killing process.", dockerCmd.Process.Pid, dockerContainerID)
+				if err := dockerCmd.Process.Kill(); err != nil {
+					logError("MCP_CLEANUP_DOCKER: Failed to kill Docker process (PID: %d, Container: %s): %v", dockerCmd.Process.Pid, dockerContainerID, err)
+				} else {
+					logInfo("MCP_CLEANUP_DOCKER: Docker process (PID: %d, Container: %s) killed.", dockerCmd.Process.Pid, dockerContainerID)
+				}
 				<-done // Wait for process to be killed
+				logInfo("MCP_CLEANUP_DOCKER: Docker process (PID: %d, Container: %s) confirmed killed.", dockerCmd.Process.Pid, dockerContainerID)
 			}
 			dockerCmd = nil
+		} else {
+			logInfo("MCP_CLEANUP_DOCKER: No Docker command/process to wait for (dockerCmd or dockerCmd.Process is nil) for container %s.", dockerContainerID)
 		}
 
-		// Stop the container if it's still running
+		// Stop the container if it's still running (e.g., if process exited but container state is still 'running')
+		// And remove it
 		if dockerContainerID != "" {
-			logInfo("Stopping Docker container: %s", dockerContainerID)
-			stopCmd := exec.Command("docker", "stop", dockerContainerID)
-			if err := stopCmd.Run(); err != nil {
-				logWarn("Failed to stop Docker container %s: %v", dockerContainerID, err)
+			logInfo("MCP_CLEANUP_DOCKER: Attempting to stop and remove Docker container by ID: %s", dockerContainerID)
+			// Stop the container first
+			stopCmdArgs := []string{"docker", "stop", dockerContainerID}
+			logDebug("MCP_CLEANUP_DOCKER: Executing: %v", stopCmdArgs)
+			stopCmd := exec.Command(stopCmdArgs[0], stopCmdArgs[1:]...)
+			if output, err := stopCmd.CombinedOutput(); err != nil {
+				logWarn("MCP_CLEANUP_DOCKER: Failed to stop Docker container %s: %v. Output: %s", dockerContainerID, err, string(output))
 			} else {
-				logInfo("Docker container %s stopped successfully", dockerContainerID)
+				logInfo("MCP_CLEANUP_DOCKER: Docker container %s stopped successfully. Output: %s", dockerContainerID, string(output))
+			}
+
+			// Remove the container
+			rmCmdArgs := []string{"docker", "rm", dockerContainerID}
+			logDebug("MCP_CLEANUP_DOCKER: Executing: %v", rmCmdArgs)
+			rmCmd := exec.Command(rmCmdArgs[0], rmCmdArgs[1:]...)
+			if output, err := rmCmd.CombinedOutput(); err != nil {
+				logWarn("MCP_CLEANUP_DOCKER: Failed to remove Docker container %s: %v. Output: %s", dockerContainerID, err, string(output))
+			} else {
+				logInfo("MCP_CLEANUP_DOCKER: Docker container %s removed successfully. Output: %s", dockerContainerID, string(output))
 			}
 		}
 
+		logInfo("MCP_CLEANUP_DOCKER: Resetting Docker state variables.")
 		dockerRunning = false
 		dockerContainerID = ""
 		dockerHostPort = ""
+	} else {
+		logInfo("MCP_CLEANUP_DOCKER: Docker not running, no container to clean up.")
 	}
+	logInfo("MCP_CLEANUP_DOCKER: Docker container cleanup finished.")
 }
 
 // --- REST Client Functions for MCP Tools ---
@@ -3272,62 +3497,99 @@ func runKeepaliveMode() {
 // --- Docker Keepalive Handler ---
 
 func handleDockerKeepalive(stdout io.Reader, stdin io.Writer) {
-	logInfo("Starting Docker keepalive handler")
+	currentContainerID := dockerContainerID // Capture at start for logging clarity
+	logInfo("DOCKER_KEEPALIVE: Handler started for container %s.", currentContainerID)
 	scanner := bufio.NewScanner(stdout)
 
 	// Create a channel to signal when scanning is done
 	scanDone := make(chan struct{})
+	var scanErr error // To store scanner error
 
 	// Start scanning in a separate goroutine
 	go func() {
-		defer close(scanDone)
+		defer func() {
+			logDebug("DOCKER_KEEPALIVE: Scanner goroutine for %s is exiting.", currentContainerID)
+			close(scanDone)
+		}()
+		logDebug("DOCKER_KEEPALIVE: Scanner goroutine for %s started.", currentContainerID)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
-			logDebug("Docker stdout: %s", line)
+			logDebug("DOCKER_KEEPALIVE (Container: %s) | Docker stdout: %s", currentContainerID, line)
 
 			if line == "ping" {
-				logDebug("Received ping from Docker container, sending pong")
+				logInfo("DOCKER_KEEPALIVE (Container: %s) | Received 'ping' from Docker container.", currentContainerID)
 
 				// Check if we should stop before writing
 				select {
 				case <-dockerKeepaliveDone:
-					logDebug("Keepalive handler stopping, not sending pong")
-					return
+					logInfo("DOCKER_KEEPALIVE (Container: %s) | Keepalive handler stopping (dockerKeepaliveDone closed), not sending 'pong'.", currentContainerID)
+					return // Exit goroutine
 				default:
+					// Continue
 				}
 
+				logInfo("DOCKER_KEEPALIVE (Container: %s) | Sending 'pong' to Docker container.", currentContainerID)
 				if _, err := stdin.Write([]byte("pong\n")); err != nil {
-					logError("Failed to send pong to Docker container: %v", err)
-					return
+					logError("DOCKER_KEEPALIVE (Container: %s) | Failed to send 'pong' to Docker container: %v", currentContainerID, err)
+					// This is a critical error, the communication is broken.
+					// We should probably signal that the container is unhealthy.
+					// For now, just return and let the main select block handle it.
+					scanErr = err // Store error
+					return        // Exit goroutine
 				}
+				logDebug("DOCKER_KEEPALIVE (Container: %s) | 'pong' sent successfully.", currentContainerID)
 			}
+		}
+		// After loop, check for scanner error
+		if err := scanner.Err(); err != nil {
+			logError("DOCKER_KEEPALIVE (Container: %s) | Scanner error after loop: %v", currentContainerID, err)
+			scanErr = err // Store error
+		} else {
+			logInfo("DOCKER_KEEPALIVE (Container: %s) | Scanner finished without error (EOF or closed).", currentContainerID)
 		}
 	}()
 
-	// Wait for either scan completion or stop signal
+	// Wait for either scan completion or stop signal from dockerKeepaliveDone
 	select {
 	case <-scanDone:
-		if err := scanner.Err(); err != nil {
-			logError("Error reading from Docker stdout: %v", err)
+		logInfo("DOCKER_KEEPALIVE (Container: %s) | ScanDone channel closed.", currentContainerID)
+		if scanErr != nil {
+			logError("DOCKER_KEEPALIVE (Container: %s) | Exited due to scanner error: %v", currentContainerID, scanErr)
+		} else {
+			logInfo("DOCKER_KEEPALIVE (Container: %s) | Exited due to stdout stream close/EOF.", currentContainerID)
 		}
-		logInfo("Docker keepalive handler exited due to stdout close")
+		// This path means the container's stdout ended (it might have exited or closed stdout).
 	case <-dockerKeepaliveDone:
-		logInfo("Docker keepalive handler exited due to stop signal")
-		return
+		logInfo("DOCKER_KEEPALIVE (Container: %s) | Exited due to stop signal (dockerKeepaliveDone channel closed).", currentContainerID)
+		// This path means cleanupDockerContainer or beginToolHandler (for an old container) initiated the stop.
+		// The scanner goroutine should also see dockerKeepaliveDone and exit.
+		return // Explicitly return, main logic for dockerDied is below.
 	}
 
-	// If we exit the keepalive handler due to stdout close, the container likely died
+	// If we reach here, it means the keepalive handler is exiting primarily because of issues
+	// with the Docker container's communication (scanDone closed, possibly with error),
+	// NOT because it was explicitly asked to stop via dockerKeepaliveDone for a controlled shutdown.
+	logWarn("DOCKER_KEEPALIVE (Container: %s) | Communication with Docker container potentially lost or container exited.", currentContainerID)
 	dockerMutex.Lock()
-	if dockerRunning {
-		logWarn("Docker container communication lost, marking as not running")
-		dockerRunning = false
-		// Signal that Docker died
+	defer dockerMutex.Unlock()
+	// Check if this is still the active container and if it was marked as running.
+	// It's possible a new container was started, and this is the keepalive for an old one.
+	if dockerRunning && dockerContainerID == currentContainerID {
+		logWarn("DOCKER_KEEPALIVE (Container: %s) | Marking active Docker container as not running due to communication loss/exit.", currentContainerID)
+		dockerRunning = false // Mark as not running. Actual cleanup (stop/rm) happens elsewhere or if begin is called again.
+
+		// Signal that this specific Docker container instance died.
+		// This is important for the MCP server to react if its active container dies.
+		logInfo("DOCKER_KEEPALIVE (Container: %s) | Closing dockerDied channel to signal container death.", currentContainerID)
 		select {
 		case <-dockerDied:
-			// Already closed
+			logWarn("DOCKER_KEEPALIVE (Container: %s) | dockerDied channel was already closed.", currentContainerID)
 		default:
 			close(dockerDied)
+			logInfo("DOCKER_KEEPALIVE (Container: %s) | dockerDied channel closed.", currentContainerID)
 		}
+	} else {
+		logInfo("DOCKER_KEEPALIVE (Container: %s) | Docker container was already marked not running or a new container is active (current active: %s). No action taken on dockerDied.", currentContainerID, dockerContainerID)
 	}
-	dockerMutex.Unlock()
+	logInfo("DOCKER_KEEPALIVE (Container: %s) | Handler finished.", currentContainerID)
 }
